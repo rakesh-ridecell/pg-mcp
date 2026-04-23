@@ -828,13 +828,18 @@ def _require_non_negative(value: int, name: str) -> None:
 
 
 def _human_bytes(n: int | None) -> str:
+    """Render a byte count as a human-readable string, preserving one
+    decimal place. Uses float division so ``1_500_000_000`` renders as
+    ``1.4 GiB``, not ``1.0 GiB``.
+    """
     if n is None:
         return "NULL"
+    size = float(n)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n //= 1024
-    return f"{n:.1f} PiB"
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PiB"
 
 
 def _format_describe(desc: Any) -> str:
@@ -901,7 +906,17 @@ def _format_describe(desc: Any) -> str:
         lines.append("")
         lines.append("### Foreign keys")
         for fk in desc.foreign_keys:
-            lines.append(f"- `{fk.name}`: `{fk.references_table}`")
+            cols = ", ".join(f"`{c}`" for c in fk.columns) or "?"
+            ref_cols = ", ".join(f"`{c}`" for c in fk.references_columns) or "?"
+            actions = []
+            if fk.on_update and fk.on_update != "NO ACTION":
+                actions.append(f"ON UPDATE {fk.on_update}")
+            if fk.on_delete and fk.on_delete != "NO ACTION":
+                actions.append(f"ON DELETE {fk.on_delete}")
+            action_suffix = f" ({', '.join(actions)})" if actions else ""
+            lines.append(
+                f"- `{fk.name}`: ({cols}) → `{fk.references_table}` ({ref_cols})" + action_suffix
+            )
 
     if desc.indexes:
         lines.append("")

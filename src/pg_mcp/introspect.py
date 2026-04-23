@@ -289,23 +289,40 @@ class IndexInfo:
     definition: str
     is_unique: bool
     is_primary: bool
+    columns: list[str]  # key columns in order (excludes INCLUDE)
 
 
 @dataclass
 class ConstraintInfo:
     name: str
-    type: str  # 'p' = PK, 'u' = unique, 'c' = check, 'f' = FK
+    type: str  # 'unique', 'check' (PK and FK have their own types)
     definition: str
 
 
 @dataclass
 class ForeignKeyInfo:
     name: str
-    columns: list[str]
-    references_table: str
-    references_columns: list[str]
-    on_update: str
+    columns: list[str]  # local columns
+    references_table: str  # 'schema.table'
+    references_columns: list[str]  # referenced columns
+    on_update: str  # "NO ACTION" | "CASCADE" | ...
     on_delete: str
+    definition: str = ""  # full pg_get_constraintdef output
+
+
+_FK_ACTION_CODES = {
+    "a": "NO ACTION",
+    "r": "RESTRICT",
+    "c": "CASCADE",
+    "n": "SET NULL",
+    "d": "SET DEFAULT",
+}
+
+
+def _fk_action(code: Any) -> str:
+    if code is None:
+        return ""
+    return _FK_ACTION_CODES.get(str(code), str(code))
 
 
 @dataclass
@@ -392,19 +409,59 @@ async def describe_table(
     )
     indexes_sql_tpl = pg_sql.SQL(
         """
-        SELECT i.relname, pg_catalog.pg_get_indexdef(ix.indexrelid),
-               ix.indisunique, ix.indisprimary
+        SELECT
+            i.relname,
+            pg_catalog.pg_get_indexdef(ix.indexrelid),
+            ix.indisunique,
+            ix.indisprimary,
+            -- Column names for the index in key order (excludes INCLUDE columns).
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_catalog.pg_attribute a
+                  ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+                WHERE k.ord <= ix.indnkeyatts
+                ORDER BY k.ord
+            ) AS key_columns
         FROM pg_catalog.pg_index ix
         JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
         WHERE ix.indrelid = {oid}
         ORDER BY i.relname
         """
     )
+    # Constraints — for foreign keys, also resolve the referenced schema,
+    # table, and column names so ForeignKeyInfo can be populated cleanly.
     constraints_sql_tpl = pg_sql.SQL(
         """
-        SELECT con.conname, con.contype,
-               pg_catalog.pg_get_constraintdef(con.oid, true),
-               con.confupdtype, con.confdeltype
+        SELECT
+            con.conname,
+            con.contype,
+            pg_catalog.pg_get_constraintdef(con.oid, true),
+            con.confupdtype,
+            con.confdeltype,
+            -- Owning columns (NULL for checks/etc.)
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_catalog.pg_attribute a
+                  ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+                ORDER BY k.ord
+            ) AS conkey_names,
+            -- Referenced table (FK only)
+            CASE WHEN con.contype = 'f' THEN (
+                SELECT rn.nspname || '.' || rc.relname
+                FROM pg_catalog.pg_class rc
+                JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace
+                WHERE rc.oid = con.confrelid
+            ) END AS confrel_qualified,
+            -- Referenced columns (FK only)
+            CASE WHEN con.contype = 'f' THEN ARRAY(
+                SELECT a.attname
+                FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_catalog.pg_attribute a
+                  ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+                ORDER BY k.ord
+            ) END AS confkey_names
         FROM pg_catalog.pg_constraint con
         WHERE con.conrelid = {oid}
         ORDER BY con.contype, con.conname
@@ -462,24 +519,19 @@ async def describe_table(
                 definition=r[1],
                 is_unique=_as_bool(r[2]),
                 is_primary=_as_bool(r[3]),
+                columns=list(r[4] or ()),
             )
             for r in ix_rows
         ]
 
-        # PK cols extracted from the PK index definition.
-        pk_cols: list[str] = []
-        for ix in indexes:
-            if ix.is_primary:
-                start = ix.definition.rfind("(")
-                end = ix.definition.rfind(")")
-                if 0 <= start < end:
-                    pk_cols = [
-                        p.strip().strip('"').split(" ")[0]
-                        for p in ix.definition[start + 1 : end].split(",")
-                    ]
-                break
+        # PK cols: read from the PK index's column list (reliable even
+        # for expression indexes and INCLUDE columns).
+        pk_cols: list[str] = next(
+            (ix.columns for ix in indexes if ix.is_primary),
+            [],
+        )
 
-        # ---- 4. Constraints
+        # ---- 4. Constraints (FK fields fully resolved from pg_constraint)
         con_rows = await _fetchall(cur, constraints_sql_tpl.format(oid=_lit(oid)))
         unique_cs: list[ConstraintInfo] = []
         check_cs: list[ConstraintInfo] = []
@@ -494,11 +546,12 @@ async def describe_table(
                 fks.append(
                     ForeignKeyInfo(
                         name=name,
-                        columns=[],
-                        references_table=defn,  # definition string contains it
-                        references_columns=[],
-                        on_update=_as_str_or_none(r[3]) or "",
-                        on_delete=_as_str_or_none(r[4]) or "",
+                        columns=list(r[5] or ()),
+                        references_table=_as_str_or_none(r[6]) or "",
+                        references_columns=list(r[7] or ()),
+                        on_update=_fk_action(r[3]),
+                        on_delete=_fk_action(r[4]),
+                        definition=defn,
                     )
                 )
 

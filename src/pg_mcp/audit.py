@@ -40,15 +40,23 @@ def _sql_hash(sql: str) -> str:
     return "sha256:" + hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
 
 
-def _sql_preview(sql: str, max_chars: int = 200) -> str:
-    compact = " ".join(sql.split())
+def _sql_redact(sql: str) -> str:
+    return _LITERAL_RE.sub("?", sql)
+
+
+def _sql_preview(sql: str, *, redact: bool, max_chars: int = 200) -> str:
+    """First N chars of a compacted SQL string.
+
+    When *redact* is true (the default for ``hash`` and ``redacted``
+    modes), string and numeric literals are replaced with ``?`` before
+    truncation so the preview cannot leak literal values (e.g., emails
+    in a WHERE clause).
+    """
+    source = _sql_redact(sql) if redact else sql
+    compact = " ".join(source.split())
     if len(compact) <= max_chars:
         return compact
     return compact[: max_chars - 1] + "…"
-
-
-def _sql_redact(sql: str) -> str:
-    return _LITERAL_RE.sub("?", sql)
 
 
 def platform_default_log_path() -> Path:
@@ -94,6 +102,16 @@ class AuditLogger:
                 backupCount=backup_count,
                 encoding="utf-8",
             )
+            # Audit logs may contain SQL fragments with sensitive data
+            # (even in hash mode the file exists and grows). Lock it to
+            # owner-only. `touch()` first so the file exists for chmod
+            # even if nothing has been written yet.
+            try:
+                log_file.touch(exist_ok=True)
+                log_file.chmod(0o600)
+            except OSError:
+                # best effort on unusual filesystems (NFS, tmpfs, ...)
+                pass
         except OSError as e:
             # Fall back to stderr-only if the file location is unwritable.
             sys.stderr.write(
@@ -113,9 +131,14 @@ class AuditLogger:
     # -----------------------------------------------------------------
 
     def _encode_sql(self, sql: str) -> dict[str, Any]:
+        # The preview is always redacted unless the operator has
+        # explicitly opted into `full` mode — otherwise literals in a
+        # WHERE clause (emails, user IDs, secrets) would leak even in
+        # hash mode.
+        redact_preview = self.log_sql_mode != "full"
         out: dict[str, Any] = {
             "sql_hash": _sql_hash(sql),
-            "sql_preview": _sql_preview(sql),
+            "sql_preview": _sql_preview(sql, redact=redact_preview),
         }
         if self.log_sql_mode == "redacted":
             out["sql_redacted"] = _sql_redact(sql)
