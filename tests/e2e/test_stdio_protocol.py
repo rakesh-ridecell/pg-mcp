@@ -107,6 +107,7 @@ def test_stdio_handshake_and_tool_list(dead_config: Path) -> None:
         names = {t["name"] for t in tools}
         assert names == {
             "list_connections",
+            "reconnect",
             "list_schemas",
             "list_tables",
             "list_views",

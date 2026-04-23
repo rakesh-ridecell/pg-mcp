@@ -140,6 +140,29 @@ class ConnectionConfig(BaseModel):
     search_path: list[str] | None = None
     pool: PoolSettings = Field(default_factory=PoolSettings)
 
+    # Per-connection schema visibility. Applied as a post-filter to
+    # every introspection tool AND as a pre-flight parser check on any
+    # run_query/explain_query that references tables — the query is
+    # rejected before it reaches Postgres if it touches a schema not in
+    # the allow-list or in the deny-list. Both optional; if both are
+    # unset the role's grants are the only gate.
+    allowed_schemas: list[str] | None = None
+    denied_schemas: list[str] | None = None
+
+    @field_validator("allowed_schemas", "denied_schemas")
+    @classmethod
+    def _validate_schema_lists(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError("must be a list of schema names")
+        cleaned: list[str] = []
+        for s in v:
+            if not isinstance(s, str) or not s:
+                raise ValueError(f"schema name must be a non-empty string, got {s!r}")
+            cleaned.append(s)
+        return cleaned
+
     @field_validator("name")
     @classmethod
     def _validate_name(cls, v: str) -> str:

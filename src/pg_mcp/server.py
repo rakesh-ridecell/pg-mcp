@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from mcp.types import ToolAnnotations
 from pg_mcp import __version__
 from pg_mcp.audit import AuditLogger
 from pg_mcp.config import Config
-from pg_mcp.connections import ConnectionRegistry
+from pg_mcp.connections import ConnectionRegistry, ConnectionStatus
 from pg_mcp.errors import (
     PgMcpError,
     PolicyViolation,
@@ -40,7 +41,7 @@ from pg_mcp.introspect import (
 )
 from pg_mcp.render import ColumnSpec, render_preamble, render_table
 from pg_mcp.runner import run_select
-from pg_mcp.safety import assert_readonly
+from pg_mcp.safety import SchemaPolicy, assert_readonly
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,16 @@ def _register_tools(
     audit: AuditLogger,
 ) -> None:
     defaults = config.defaults
+
+    # Build a SchemaPolicy per connection upfront.
+    schema_policies: dict[str, SchemaPolicy] = {
+        c.name: SchemaPolicy(allowed=c.allowed_schemas, denied=c.denied_schemas)
+        for c in config.connections
+    }
+
+    def _schema_policy(name: str) -> SchemaPolicy:
+        return schema_policies.get(name, SchemaPolicy())
+
     ro_annotations = ToolAnnotations(
         readOnlyHint=True,
         destructiveHint=False,
@@ -137,6 +148,46 @@ def _register_tools(
 
     # -----------------------------------------------------------------
     @mcp.tool(
+        name="reconnect",
+        description=(
+            "Close and re-open the pool for a named connection, re-running "
+            "the read-only probe. Use this when `list_connections` shows a "
+            "connection as `unavailable` (network flapped, DB restarted, "
+            "credentials rotated) — it avoids restarting the MCP server."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,  # changes server-internal state
+            destructiveHint=False,  # doesn't touch the DB
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def reconnect(connection: str) -> str:
+        rid = _rid()
+        try:
+            entry = await registry.reopen(connection)
+        except PgMcpError as e:
+            return _error_response(audit, rid, "reconnect", connection, e)
+        audit.tool_call(
+            request_id=rid,
+            tool="reconnect",
+            connection=connection,
+            params={},
+            status="ok" if entry.status == ConnectionStatus.AVAILABLE else "degraded",
+        )
+        return _wrap(
+            {
+                "connection": connection,
+                "new_status": entry.status.value,
+                "last_error": entry.last_error,
+                "tool": "reconnect",
+            },
+            f"Connection `{connection}` is now **{entry.status.value}**"
+            + (f" — {entry.last_error}" if entry.last_error else ""),
+        )
+
+    # -----------------------------------------------------------------
+    @mcp.tool(
         name="list_schemas",
         description=(
             "List schemas visible to the read-only role. "
@@ -153,6 +204,11 @@ def _register_tools(
             rows = await _list_schemas(pool, include_system=include_system)
         except PgMcpError as e:
             return _error_response(audit, rid, "list_schemas", connection, e)
+
+        # Apply the config-level schema allow/deny filter — hide schemas
+        # the LLM shouldn't see in this connection.
+        policy = _schema_policy(connection)
+        rows = [r for r in rows if policy.is_allowed(r["name"])]
 
         audit.tool_call(
             request_id=rid,
@@ -195,6 +251,18 @@ def _register_tools(
         offset: int = 0,
     ) -> str:
         rid = _rid()
+        try:
+            _require_identifier(schema, "schema")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "list_tables", connection, e)
+        if not _schema_policy(connection).is_allowed(schema):
+            return _error_response(
+                audit,
+                rid,
+                "list_tables",
+                connection,
+                PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
+            )
         _require_positive(limit, "limit", max_value=2000)
         _require_non_negative(offset, "offset")
         try:
@@ -269,6 +337,18 @@ def _register_tools(
         offset: int = 0,
     ) -> str:
         rid = _rid()
+        try:
+            _require_identifier(schema, "schema")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "list_views", connection, e)
+        if not _schema_policy(connection).is_allowed(schema):
+            return _error_response(
+                audit,
+                rid,
+                "list_views",
+                connection,
+                PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
+            )
         _require_positive(limit, "limit", max_value=2000)
         _require_non_negative(offset, "offset")
         try:
@@ -324,6 +404,19 @@ def _register_tools(
     )
     async def describe_table_tool(connection: str, schema: str, table: str) -> str:
         rid = _rid()
+        try:
+            _require_identifier(schema, "schema")
+            _require_identifier(table, "table")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "describe_table", connection, e)
+        if not _schema_policy(connection).is_allowed(schema):
+            return _error_response(
+                audit,
+                rid,
+                "describe_table",
+                connection,
+                PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
+            )
         try:
             pool = await registry.await_pool(connection)
             desc = await describe_table(pool, schema=schema, table=table)
@@ -383,6 +476,19 @@ def _register_tools(
     )
     async def describe_view_tool(connection: str, schema: str, view: str) -> str:
         rid = _rid()
+        try:
+            _require_identifier(schema, "schema")
+            _require_identifier(view, "view")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "describe_view", connection, e)
+        if not _schema_policy(connection).is_allowed(schema):
+            return _error_response(
+                audit,
+                rid,
+                "describe_view",
+                connection,
+                PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
+            )
         try:
             pool = await registry.await_pool(connection)
             desc = await describe_table(pool, schema=schema, table=view)
@@ -445,6 +551,19 @@ def _register_tools(
         limit: int = 20,
     ) -> str:
         rid = _rid()
+        try:
+            _require_identifier(schema, "schema")
+            _require_identifier(table, "table")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "sample_rows", connection, e)
+        if not _schema_policy(connection).is_allowed(schema):
+            return _error_response(
+                audit,
+                rid,
+                "sample_rows",
+                connection,
+                PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
+            )
         _require_positive(limit, "limit", max_value=1000)
         try:
             pool = await registry.await_pool(connection)
@@ -528,6 +647,7 @@ def _register_tools(
         # Parser check BEFORE touching Postgres.
         try:
             assert_readonly(sql)
+            _schema_policy(connection).check_sql(sql)
         except PolicyViolation as e:
             return _error_response(audit, rid, "run_query", connection, e, sql=sql)
 
@@ -588,7 +708,21 @@ def _register_tools(
         analyze: bool = False,
     ) -> str:
         rid = _rid()
-        explain_sql = f"EXPLAIN ({'ANALYZE, ' if analyze else ''}VERBOSE, COSTS) {sql}"
+        # Strip a leading EXPLAIN (...) from the user's SQL so we don't
+        # wrap EXPLAIN-in-EXPLAIN, which is a parse error.
+        inner_sql = _strip_leading_explain(sql)
+        # Validate the inner SQL first — this gives a cleaner error
+        # ("disallowed_statement: InsertStmt") rather than the
+        # double-wrapped version that might confuse the LLM.
+        try:
+            assert_readonly(inner_sql)
+            _schema_policy(connection).check_sql(inner_sql)
+        except PolicyViolation as e:
+            return _error_response(audit, rid, "explain_query", connection, e, sql=sql)
+        explain_sql = f"EXPLAIN ({'ANALYZE, ' if analyze else ''}VERBOSE, COSTS) {inner_sql}"
+        # Re-check the wrapped form in case ANALYZE-of-DML somehow slipped
+        # through (e.g., inner was a CTE-DML we missed — shouldn't happen,
+        # but belt-and-braces).
         try:
             assert_readonly(explain_sql)
         except PolicyViolation as e:
@@ -716,6 +850,19 @@ def _register_tools(
     async def table_stats_tool(connection: str, schema: str, table: str) -> str:
         rid = _rid()
         try:
+            _require_identifier(schema, "schema")
+            _require_identifier(table, "table")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "table_stats", connection, e)
+        if not _schema_policy(connection).is_allowed(schema):
+            return _error_response(
+                audit,
+                rid,
+                "table_stats",
+                connection,
+                PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
+            )
+        try:
             pool = await registry.await_pool(connection)
             stats = await _table_stats(pool, schema=schema, table=table)
         except PgMcpError as e:
@@ -825,6 +972,53 @@ def _require_positive(value: int, name: str, *, max_value: int | None = None) ->
 def _require_non_negative(value: int, name: str) -> None:
     if value < 0:
         raise ToolInputError(f"{name} must be >= 0, got {value}")
+
+
+# Identifier validation — defence against non-string / empty / absurd
+# inputs before they reach psycopg.sql.Identifier. psycopg would handle
+# quoting correctly, but the error message surfaced to the LLM is much
+# clearer if we reject up front.
+_IDENT_MAX_LEN = 63  # PostgreSQL's NAMEDATALEN-1
+
+
+def _require_identifier(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise ToolInputError(f"{name} must be a string, got {type(value).__name__}")
+    if not value:
+        raise ToolInputError(f"{name} must be non-empty")
+    if len(value) > _IDENT_MAX_LEN:
+        raise ToolInputError(
+            f"{name} is {len(value)} chars; Postgres identifiers are max {_IDENT_MAX_LEN}"
+        )
+    # Control characters and NUL bytes have no business in an identifier.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise ToolInputError(f"{name} contains control characters")
+    return value
+
+
+_LEADING_EXPLAIN_RE = re.compile(
+    r"""
+    \A                              # start
+    \s*                             # leading whitespace
+    EXPLAIN                         # keyword
+    (?:\s*\([^)]*\))?               # optional parenthesized options, e.g., (ANALYZE, VERBOSE)
+    (?:\s+(?:ANALYZE|VERBOSE))*     # legacy-form trailing keywords (pre-9.0 syntax)
+    \s+                             # whitespace before the inner stmt
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _strip_leading_explain(sql: str) -> str:
+    """Remove a leading ``EXPLAIN [(...)]`` from *sql* if present.
+
+    Used by ``explain_query`` so users can pass either an already-
+    prefixed ``EXPLAIN SELECT ...`` or a bare ``SELECT ...`` without
+    producing invalid ``EXPLAIN EXPLAIN ...`` SQL. When nothing is
+    stripped, returns *sql* unchanged.
+    """
+    match = _LEADING_EXPLAIN_RE.match(sql)
+    return sql[match.end() :] if match else sql
 
 
 def _human_bytes(n: int | None) -> str:

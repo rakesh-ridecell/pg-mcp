@@ -158,6 +158,22 @@ class ConnectionRegistry:
             return_exceptions=True,
         )
 
+    async def reopen(
+        self,
+        name: str,
+        *,
+        timeout: float = 10.0,
+    ) -> ConnectionEntry:
+        """Close the existing pool (if any) for *name* and open a fresh one.
+
+        Used by the ``reconnect`` tool and by operators via ``pg-mcp
+        doctor``. Blocks until the re-probe has completed.
+        """
+        entry = self.get_entry(name)
+        await self._close_one(entry)
+        await self._open_one(entry, probe=True, timeout=timeout)
+        return entry
+
     def open_all_background(
         self,
         *,

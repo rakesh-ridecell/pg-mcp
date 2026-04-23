@@ -281,10 +281,74 @@ def assert_readonly(sql: str, *, max_len: int = DEFAULT_MAX_SQL_LEN) -> None:
         raise guard.violation
 
 
+def extract_referenced_schemas(sql: str) -> set[str]:
+    """Return the set of schema names explicitly referenced in *sql*.
+
+    Walks the AST looking for ``RangeVar`` nodes (table references in
+    ``FROM``, ``JOIN``, etc.) and collects their ``schemaname``. Tables
+    referenced without a schema qualifier are NOT included in the
+    result — the caller has to decide separately whether an
+    unqualified reference is allowed (typically by treating the
+    connection's ``search_path`` as the effective schema).
+
+    Parse errors return an empty set; the caller should run
+    :func:`assert_readonly` first to distinguish.
+    """
+    try:
+        raws = parse_sql(sql)
+    except Exception:
+        return set()
+    schemas: set[str] = set()
+
+    class _Collector(Visitor):
+        def visit(self, ancestors: object, node: object) -> None:  # type: ignore[override]
+            if isinstance(node, ast.RangeVar):
+                name = getattr(node, "schemaname", None)
+                if name:
+                    schemas.add(str(name).lower())
+
+    _Collector()(raws)
+    return schemas
+
+
+class SchemaPolicy:
+    """Allow-list / deny-list check for schema references.
+
+    Instantiate once per connection with the config-level lists; reuse
+    across requests. ``check()`` raises :class:`PolicyViolation` on any
+    violation.
+    """
+
+    def __init__(
+        self,
+        *,
+        allowed: list[str] | None = None,
+        denied: list[str] | None = None,
+    ) -> None:
+        self.allowed: set[str] | None = {s.lower() for s in allowed} if allowed else None
+        self.denied: set[str] = {s.lower() for s in (denied or ())}
+
+    def is_allowed(self, schema: str) -> bool:
+        name = schema.lower()
+        if name in self.denied:
+            return False
+        return not (self.allowed is not None and name not in self.allowed)
+
+    def check_sql(self, sql: str) -> None:
+        """Raise ``PolicyViolation`` if *sql* references a disallowed schema."""
+        if self.allowed is None and not self.denied:
+            return
+        for schema in extract_referenced_schemas(sql):
+            if not self.is_allowed(schema):
+                raise PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted")
+
+
 __all__ = [
     "ALLOWED_TOP",
     "FORBIDDEN_ANYWHERE",
     "FUNCTION_DENYLIST",
     "FUNCTION_DENYLIST_PREFIXES",
+    "SchemaPolicy",
     "assert_readonly",
+    "extract_referenced_schemas",
 ]
