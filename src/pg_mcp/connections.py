@@ -265,12 +265,50 @@ class ConnectionRegistry:
         """
         entry = self.get_entry(name)
         if entry.status == ConnectionStatus.UNSAFE:
-            raise ConnectionUnsafeError(f"connection {name!r} is marked UNSAFE: {entry.last_error}")
+            raise ConnectionUnsafeError(
+                f"connection {name!r} is marked UNSAFE: {entry.last_error}"
+            )
         if entry.pool is None or entry.status != ConnectionStatus.AVAILABLE:
             raise ConnectionUnavailableError(
                 f"connection {name!r} is {entry.status.value}: {entry.last_error or 'unknown'}"
             )
         return entry.pool
+
+    async def await_pool(
+        self, name: str, *, timeout: float = 10.0
+    ) -> AsyncConnectionPool:
+        """Return a usable pool, waiting up to *timeout* for PENDING to
+        transition to AVAILABLE.
+
+        This is the async variant tools should use — when the server
+        has just started, pools may still be opening in the background,
+        and we'd rather briefly wait than immediately fail.
+        """
+        entry = self.get_entry(name)
+        if entry.status == ConnectionStatus.UNSAFE:
+            raise ConnectionUnsafeError(
+                f"connection {name!r} is marked UNSAFE: {entry.last_error}"
+            )
+        if entry.status == ConnectionStatus.AVAILABLE and entry.pool is not None:
+            return entry.pool
+
+        # Wait for PENDING to transition. Poll at 50ms granularity.
+        if entry.status == ConnectionStatus.PENDING:
+            import time as _time
+
+            deadline = _time.monotonic() + timeout
+            while entry.status == ConnectionStatus.PENDING and _time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            if entry.status == ConnectionStatus.AVAILABLE and entry.pool is not None:
+                return entry.pool
+            if entry.status == ConnectionStatus.UNSAFE:
+                raise ConnectionUnsafeError(
+                    f"connection {name!r} is marked UNSAFE: {entry.last_error}"
+                )
+
+        raise ConnectionUnavailableError(
+            f"connection {name!r} is {entry.status.value}: {entry.last_error or 'unknown'}"
+        )
 
 
 __all__ = [

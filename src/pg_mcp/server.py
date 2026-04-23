@@ -149,7 +149,7 @@ def _register_tools(
     async def list_schemas(connection: str, include_system: bool = False) -> str:
         rid = _rid()
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             rows = await _list_schemas(pool, include_system=include_system)
         except PgMcpError as e:
             return _error_response(audit, rid, "list_schemas", connection, e)
@@ -198,7 +198,7 @@ def _register_tools(
         _require_positive(limit, "limit", max_value=2000)
         _require_non_negative(offset, "offset")
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             rows, total = await list_relations(
                 pool,
                 schema=schema,
@@ -272,7 +272,7 @@ def _register_tools(
         _require_positive(limit, "limit", max_value=2000)
         _require_non_negative(offset, "offset")
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             rows, total = await list_relations(
                 pool,
                 schema=schema,
@@ -325,7 +325,7 @@ def _register_tools(
     async def describe_table_tool(connection: str, schema: str, table: str) -> str:
         rid = _rid()
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             desc = await describe_table(pool, schema=schema, table=table)
         except PgMcpError as e:
             return _error_response(audit, rid, "describe_table", connection, e)
@@ -384,7 +384,7 @@ def _register_tools(
     async def describe_view_tool(connection: str, schema: str, view: str) -> str:
         rid = _rid()
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             desc = await describe_table(pool, schema=schema, table=view)
         except PgMcpError as e:
             return _error_response(audit, rid, "describe_view", connection, e)
@@ -447,7 +447,7 @@ def _register_tools(
         rid = _rid()
         _require_positive(limit, "limit", max_value=1000)
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             conn_cfg = config.get(connection)
             timeout = (
                 conn_cfg.statement_timeout_ms
@@ -532,7 +532,7 @@ def _register_tools(
             return _error_response(audit, rid, "run_query", connection, e, sql=sql)
 
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             result = await run_select(
                 pool,
                 sql,
@@ -601,7 +601,7 @@ def _register_tools(
             else defaults.statement_timeout_ms
         )
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             result = await run_select(
                 pool,
                 explain_sql,
@@ -671,7 +671,7 @@ def _register_tools(
             )
 
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             hits = await _search_schema(pool, pattern=pattern, kind=kind, limit=limit)
         except PgMcpError as e:
             return _error_response(audit, rid, "search_schema", connection, e)
@@ -716,7 +716,7 @@ def _register_tools(
     async def table_stats_tool(connection: str, schema: str, table: str) -> str:
         rid = _rid()
         try:
-            pool = registry.get_pool(connection)
+            pool = await registry.await_pool(connection)
             stats = await _table_stats(pool, schema=schema, table=table)
         except PgMcpError as e:
             return _error_response(audit, rid, "table_stats", connection, e)
