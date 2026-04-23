@@ -100,10 +100,19 @@ def redact_conninfo(conninfo: str) -> str:
 
 
 async def _configure_conn(conn: AsyncConnection) -> None:
-    """Pool configure hook: belt-and-braces RO + app_name for every backend."""
+    """Pool configure hook: belt-and-braces RO + app_name for every backend.
+
+    The pool requires the connection to be returned in IDLE (not
+    INTRANS) state, so we commit after the SETs. Since SET is not
+    transactional, committing here is effectively a no-op that just
+    ends the implicit transaction.
+    """
+    # SET is a utility statement and doesn't accept bind parameters, so we
+    # use literal SQL. The app_name is hard-coded and safe.
     async with conn.cursor() as cur:
         await cur.execute("SET default_transaction_read_only = on")
-        await cur.execute("SET application_name = %s", ("pg-mcp",))
+        await cur.execute("SET application_name = 'pg-mcp'")
+    await conn.commit()
 
 
 class ConnectionRegistry:

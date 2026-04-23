@@ -72,6 +72,7 @@ connections:
 RO_GRANTS_TEMPLATE = """\
 -- Run as a Postgres superuser / DB owner to create the RO role used by pg-mcp.
 -- Replace <role>, <password>, <database>, and the schema list as needed.
+-- NOTE: role names starting with 'pg_' are reserved by Postgres. Don't use them.
 
 CREATE ROLE {role} LOGIN PASSWORD '{password}';
 
@@ -179,8 +180,11 @@ def _parser() -> argparse.ArgumentParser:
     p_grants.add_argument("name", help="Connection name (from config).")
     p_grants.add_argument(
         "--role",
-        default="pg_mcp_ro",
-        help="Role name to create (default: pg_mcp_ro).",
+        default="pgmcp_ro",
+        help=(
+            "Role name to create (default: pgmcp_ro). Must NOT start with "
+            "'pg_' — Postgres reserves that prefix."
+        ),
     )
     p_grants.add_argument(
         "--password",

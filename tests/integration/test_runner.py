@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from pg_mcp.errors import PolicyViolation, PostgresError, QueryTimeoutError
+from pg_mcp.errors import PolicyViolation, QueryTimeoutError
 from pg_mcp.runner import run_select
 from pg_mcp.safety import assert_readonly
 
@@ -64,22 +64,28 @@ async def test_parser_blocks_before_pg(test_pool) -> None:
 
 
 async def test_ro_txn_blocks_writes_even_if_parser_bypassed(test_pool) -> None:
-    """Directly execute an INSERT through the runner (bypassing the
-    parser via run_select) and verify the READ ONLY transaction
-    rejects it with SQLSTATE 25006."""
-    # This test DELIBERATELY skips assert_readonly to prove layer-2
-    # independence. Only a test should ever call run_select without
-    # pre-validating the SQL.
-    with pytest.raises(PostgresError) as excinfo:
-        await run_select(
-            test_pool,
-            "CREATE TEMP TABLE __test_pgmcp_layer2 (id int)",
-            row_limit=1,
-            byte_limit=1000,
-            cell_limit=100,
-            timeout_ms=5000,
-        )
-    assert excinfo.value.sqlstate == "25006"
+    """Prove layer 2 (``SET TRANSACTION READ ONLY``) rejects writes
+    independently of the parser.
+
+    We can't pass DDL through ``run_select`` because it uses a
+    server-side cursor and ``DECLARE … CURSOR FOR <ddl>`` is itself a
+    syntax error. Instead we recreate the runner's exact transaction
+    envelope against the pool and attempt a write directly — this
+    isolates the RO layer from the cursor + parser layers.
+    """
+    import psycopg
+
+    with pytest.raises(psycopg.Error) as excinfo:
+        async with test_pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL statement_timeout = 5000")
+                await conn.execute("SET TRANSACTION READ ONLY")
+                # Attempt the same write the parser rejects. With the
+                # RO wrapper in place, PG must respond with 25006.
+                await conn.execute("CREATE TEMP TABLE __test_pgmcp_layer2 (id int)")
+    assert excinfo.value.sqlstate == "25006", (
+        f"expected read_only_sql_transaction (25006), got {excinfo.value.sqlstate}: {excinfo.value}"
+    )
 
 
 async def test_notices_captured(test_pool) -> None:

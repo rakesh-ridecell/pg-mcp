@@ -20,19 +20,23 @@ async def test_probe_rejects_unsafe_connection(test_pool) -> None:
     await probe_readonly(test_pool)
 
 
-async def test_probe_raises_on_rw_connection(test_pool, monkeypatch) -> None:
-    """Simulate a broken wrapper by executing CREATE TEMP TABLE directly,
-    bypassing the READ ONLY transaction. This should succeed against a
-    normal RW role — proving the probe's positive assertion (it must
-    fail with 25006) is a real signal."""
-    # Attempt CREATE TEMP TABLE directly, no RO wrapper.
-    async with test_pool.connection() as conn, conn.transaction():
-        await conn.execute("CREATE TEMP TABLE __test_rw_probe (id int) ON COMMIT DROP")
-        # If we get here without SQLSTATE 25006, the role IS read-write,
-        # which is the case with the typical `postgres` test role.
-    # Now explicitly call probe_readonly; it wraps with SET TRANSACTION
-    # READ ONLY and should reject the CREATE TEMP TABLE with 25006.
-    await probe_readonly(test_pool)  # must pass — RO wrapper is in place
+async def test_pool_configure_pins_ro_default(test_pool) -> None:
+    """The pool's ``configure`` hook runs
+    ``SET default_transaction_read_only = on`` on every new backend.
+
+    That means even a connection used *outside* our explicit RO wrapper
+    is read-only by default — verify the belt-and-braces works.
+    """
+    import psycopg
+
+    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction) as excinfo:
+        async with test_pool.connection() as conn:
+            async with conn.transaction():
+                # No explicit "SET TRANSACTION READ ONLY" here —
+                # the session-level default_transaction_read_only must
+                # carry it.
+                await conn.execute("CREATE TEMP TABLE __test_rw_probe (id int) ON COMMIT DROP")
+    assert excinfo.value.sqlstate == "25006"
 
 
 async def test_probe_against_already_read_only_connection(test_pool) -> None:

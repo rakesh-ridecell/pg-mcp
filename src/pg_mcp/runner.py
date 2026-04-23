@@ -62,10 +62,12 @@ async def run_select(
             conn.add_notice_handler(lambda diag: notices.append(diag.message_primary or ""))
             try:
                 async with conn.transaction():
-                    await conn.execute("SET LOCAL statement_timeout = %s", (timeout_ms,))
-                    await conn.execute(
-                        "SET LOCAL idle_in_transaction_session_timeout = %s", (5000,)
-                    )
+                    # SET is a utility statement and does not accept bind
+                    # parameters in PostgreSQL. The timeout is a bounded
+                    # integer from validated config (never user input),
+                    # so int()-interpolating it inline is safe.
+                    await conn.execute(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+                    await conn.execute("SET LOCAL idle_in_transaction_session_timeout = 5000")
                     await conn.execute("SET TRANSACTION READ ONLY")
 
                     if search_path:
