@@ -134,12 +134,26 @@ def _register_tools(
     async def list_connections() -> str:
         rid = _rid()
         audit.tool_call(request_id=rid, tool="list_connections", connection=None, params={})
-        lines = ["| name | status | description | last_error |", "|---|---|---|---|"]
+        lines = [
+            "| name | status | pool (open/max, waiting) | description | last_error |",
+            "|---|---|---|---|---|",
+        ]
         for entry in registry.entries():
+            pool_cell = "-"
+            if entry.pool is not None:
+                try:
+                    stats = entry.pool.get_stats()
+                    open_n = stats.get("pool_size", 0)
+                    max_n = stats.get("pool_max", entry.config.pool.max_size)
+                    waiting = stats.get("requests_waiting", 0)
+                    pool_cell = f"{open_n}/{max_n}, {waiting}"
+                except Exception:
+                    pool_cell = "?"
             lines.append(
-                "| {name} | {status} | {desc} | {err} |".format(
+                "| {name} | {status} | {pool} | {desc} | {err} |".format(
                     name=entry.config.name,
                     status=entry.status.value,
+                    pool=pool_cell,
                     desc=(entry.config.description or "").replace("|", "\\|"),
                     err=(entry.last_error or "").replace("|", "\\|"),
                 )

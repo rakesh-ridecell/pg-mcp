@@ -87,20 +87,33 @@ defaults:
 connections:
   - name: prod
     description: Production analytics replica (read-only)
-    dsn: postgresql://pg_mcp_ro@prod-replica.example.com:5432/appdb?sslmode=require
+    dsn: postgresql://pgmcp_ro@prod-replica.example.com:5432/appdb?sslmode=require
     password: ${PROD_PG_PASSWORD}
     pool:
       min_size: 1
       max_size: 5
+    # Optional: restrict which schemas this connection can see.
+    allowed_schemas: [public, app]        # only these are visible
+    # denied_schemas: [audit, pii]        # alternative: everything except these
+    # Both case-insensitive. Deny beats allow.
 
   - name: analytics
     host: warehouse.example.com
     database: analytics
-    user: pg_mcp_ro
+    user: pgmcp_ro
     password: ${ANALYTICS_PG_PASSWORD}
     sslmode: verify-full
     sslrootcert: ./certs/ca.pem   # relative to config file
 ```
+
+**`allowed_schemas` / `denied_schemas`** apply at two layers:
+1. Introspection tools (`list_schemas`, `list_tables`, `describe_*`, …)
+   filter out disallowed schemas.
+2. `run_query` / `explain_query` parse the SQL and reject any query
+   that references a disallowed schema with a qualified name
+   (`SELECT * FROM audit.events`). Unqualified refs
+   (`SELECT * FROM users`) are NOT blocked by this layer — they resolve
+   via the Postgres role's USAGE grants, which remain the final gate.
 
 ### 3. Validate
 
@@ -133,19 +146,22 @@ Or add to a project-scoped `.mcp.json`:
 
 ## Tools
 
-All tools are marked `readOnlyHint=True`, `openWorldHint=False`.
+All read tools are marked `readOnlyHint=True`, `openWorldHint=False`.
+The `reconnect` tool mutates server-internal pool state only (never
+the DB) and is marked `readOnlyHint=False`.
 
 | Tool | Parameters | Purpose |
 |---|---|---|
-| `list_connections` | — | Show configured DBs + status (available / unavailable / unsafe / pending). Always call first. |
-| `list_schemas` | `connection`, `include_system=false` | Schemas visible to the RO role. |
+| `list_connections` | — | Show configured DBs + status + pool stats (open/max, waiting). Always call first. |
+| `reconnect` | `connection` | Close and re-open the pool, re-run the RO probe. Use when a connection flaps — avoids restarting the MCP server. |
+| `list_schemas` | `connection`, `include_system=false` | Schemas visible to the RO role, filtered by the per-connection `allowed_schemas` / `denied_schemas` policy. |
 | `list_tables` | `connection`, `schema`, `include_partitions=false`, `limit=500`, `offset=0` | Ordinary + partitioned + foreign tables. Partition children hidden by default. Paginated with `total_count`. |
 | `list_views` | `connection`, `schema`, `limit=500`, `offset=0` | Views and materialized views. |
-| `describe_table` | `connection`, `schema`, `table` | Columns (types, nullable, default, identity, generated, comment), PK, unique/check constraints, FKs, indexes, inheritance, partition key, RLS, row estimate, size. |
+| `describe_table` | `connection`, `schema`, `table` | Columns (types, nullable, default, identity, generated, comment), PK (from `pg_index.indkey`), unique/check constraints, **resolved FKs** (local cols → `schema.table(cols)` with ON UPDATE/DELETE), indexes with ordered key columns, inheritance, partition key, RLS, row estimate, size. |
 | `describe_view` | `connection`, `schema`, `view` | Columns + `pg_get_viewdef`. Flags broken views. |
 | `sample_rows` | `connection`, `schema`, `table`, `limit=20` | `SELECT * LIMIT N`. Preamble includes `table_estimated_rows` and `rls_enabled` so you can distinguish empty from RLS-filtered. |
-| `run_query` | `connection`, `sql`, `limit` | Execute `SELECT` / `EXPLAIN`. Full safety pipeline. |
-| `explain_query` | `connection`, `sql`, `analyze=false` | `EXPLAIN` (or `EXPLAIN ANALYZE` for plain SELECTs). |
+| `run_query` | `connection`, `sql`, `limit` | Execute `SELECT` / `EXPLAIN`. Full safety pipeline (parser + txn + role + per-connection schema policy). |
+| `explain_query` | `connection`, `sql`, `analyze=false` | `EXPLAIN` (or `EXPLAIN ANALYZE` for plain SELECTs). A leading `EXPLAIN [(...)]` in `sql` is stripped automatically. |
 | `search_schema` | `connection`, `pattern`, `kind='all'`, `limit=100` | LIKE search across tables, views, columns, functions. |
 | `table_stats` | `connection`, `schema`, `table` | Approx rows, size, last vacuum/analyze, live/dead tuples. |
 
@@ -272,17 +288,18 @@ pg_create_logical_replication_slot, pg_drop_replication_slot, …
 
 Every error surfaced to the LLM has one of these stable codes:
 
-| Code                         | Meaning                                                              |
-|------------------------------|----------------------------------------------------------------------|
-| `invalid_parameter`          | A tool argument is out of range or the wrong type                    |
-| `unknown_connection`         | `connection` name doesn't match any in config                         |
-| `connection_unavailable`     | DB unreachable or probe in progress                                   |
-| `connection_unsafe`          | Startup RO probe did not get SQLSTATE 25006 — refused                  |
-| `connection_pool_exhausted`  | All connections in use; acquire timed out                             |
-| `sql_rejected_by_policy`     | Parser layer rejected the SQL; see `reason` sub-code                 |
-| `query_timeout`              | `statement_timeout` fired (SQLSTATE 57014)                            |
-| `postgres_error`             | Any other Postgres error; includes `sqlstate`                         |
-| `config_error`               | Startup-only; fatal                                                  |
+| Code                         | Meaning                                                              | Typical remedy |
+|------------------------------|----------------------------------------------------------------------|---|
+| `invalid_parameter`          | A tool argument is out of range, wrong type, or an invalid identifier (empty / >63 chars / control chars) | Check the tool's parameter types |
+| `unknown_connection`         | `connection` name doesn't match any in config                         | Call `list_connections` to see what's registered |
+| `connection_unavailable`     | DB unreachable, probe in progress, or pool failed to open             | `pg-mcp info <name>` for details; run `reconnect` tool to retry |
+| `connection_unsafe`          | Startup RO probe did not get SQLSTATE 25006 — connection refused      | DBA needs to fix role grants (see §Create the RO role) |
+| `connection_pool_exhausted`  | All connections in use; acquire timed out                             | Increase `pool.max_size` or reduce concurrency |
+| `sql_rejected_by_policy`     | Safety gate rejected the SQL (parser or schema policy); see `reason`  | See sub-codes below |
+| `query_timeout`              | `statement_timeout` fired (SQLSTATE 57014)                            | Add `LIMIT`, refine `WHERE`, or raise `statement_timeout_ms` |
+| `postgres_error`             | Any other Postgres error; includes `sqlstate`                         | Look up the SQLSTATE; common ones below |
+| `config_error`               | Startup-only; fatal                                                   | `pg-mcp check` validates the config |
+| `result_too_large`           | Informational flag in preamble, not a hard error                      | Add `LIMIT`, narrow columns |
 
 Sub-codes for `sql_rejected_by_policy`:
 
@@ -292,9 +309,21 @@ Sub-codes for `sql_rejected_by_policy`:
 | `sql_too_long`                    | Exceeds 100 KB (configurable)                               |
 | `sql_parse_error`                 | pglast could not parse                                      |
 | `multiple_statements_not_allowed` | More than one statement (e.g., `SELECT 1; DROP TABLE t`)     |
-| `disallowed_statement`            | Top-level or nested node not in allow-list (e.g., InsertStmt) |
-| `disallowed_function`             | Deny-listed function call (e.g., pg_read_file)               |
+| `disallowed_statement`            | Top-level or nested node not in allow-list (e.g., `InsertStmt`) |
+| `disallowed_function`             | Deny-listed function call (e.g., `pg_read_file`, `nextval`) |
+| `disallowed_schema`               | Query references a schema outside the connection's `allowed_schemas` / `denied_schemas` policy |
 | `dml_in_explain_analyze`          | `EXPLAIN ANALYZE` of non-SELECT would execute the DML        |
+
+Common Postgres `sqlstate` values you'll see in `postgres_error`:
+
+| SQLSTATE | Meaning                                       |
+|----------|-----------------------------------------------|
+| `25006`  | `read_only_sql_transaction` — write attempted against an RO session. **This is the safety net firing — good signal.** |
+| `42501`  | `insufficient_privilege` — role lacks grants on the object |
+| `42P01`  | `undefined_table` — table/view doesn't exist |
+| `42703`  | `undefined_column` — column doesn't exist |
+| `57014`  | `query_canceled` — statement_timeout fired |
+| `08006`  | `connection_failure` — DB closed the connection mid-query |
 
 ## Observability
 
@@ -347,11 +376,21 @@ Configured via `log_sql:` in the config file:
 pg-mcp serve           # run MCP server over stdio (default)
 pg-mcp init            # write a starter config to ~/.config/pg-mcp/config.yaml
 pg-mcp check           # validate config + probe all connections
+pg-mcp doctor          # comprehensive diagnostic: Python arch, deps, config,
+                       #   connectivity, role grants, RO probe, extensions,
+                       #   with remediation tips for every failure
+pg-mcp info NAME       # detailed view of one connection: status, DSN,
+                       #   pool stats, allowed/denied schemas, search_path
 pg-mcp tools           # print the tool catalogue in markdown
 pg-mcp grants NAME     # print DDL for creating the RO role
 pg-mcp version         # print version info
 pg-mcp --config PATH … # override config discovery
 ```
+
+**If something isn't working, run `pg-mcp doctor` first** — it's designed
+to catch the common first-run traps (Python architecture mismatch on
+macOS, missing deps, unreachable DB, missing grants, missing
+`pg_stat_statements`, …) and tell you exactly what to do.
 
 ## Development
 

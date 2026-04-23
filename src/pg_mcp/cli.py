@@ -20,7 +20,6 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import NoReturn
 
 from pg_mcp import __version__
 from pg_mcp.audit import AuditLogger, platform_default_log_path
@@ -56,7 +55,7 @@ defaults:
 connections:
   - name: example
     description: Example connection — replace with your own
-    dsn: postgresql://pg_mcp_ro@localhost:5432/mydb
+    dsn: postgresql://pgmcp_ro@localhost:5432/mydb
     password: ${EXAMPLE_PG_PASSWORD:-}
     pool:
       min_size: 1
@@ -67,6 +66,14 @@ connections:
     # search_path: [app, public]
     # sslmode: require
     # sslrootcert: ./certs/rds-ca.pem     # relative to this file
+
+    # Optional schema allow/deny lists. Both are case-insensitive.
+    # If allowed_schemas is set, only these are visible.
+    # If denied_schemas is set, these are hidden. Deny beats allow.
+    # Applies to BOTH introspection tools AND schema-qualified
+    # references in run_query / explain_query.
+    # allowed_schemas: [public, app]
+    # denied_schemas: [audit, pii]
 """
 
 RO_GRANTS_TEMPLATE = """\
@@ -94,7 +101,7 @@ ALTER ROLE {role} SET default_transaction_read_only = on;
 # ---------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> NoReturn:
+def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command is None:
         args.command = "serve"
@@ -113,9 +120,13 @@ def main(argv: list[str] | None = None) -> NoReturn:
     if args.command == "grants":
         sys.exit(_cmd_grants(args))
 
-    # For serve / check we need a config.
+    # For serve / check / info we need a config. Doctor can run without
+    # one (it'll still check Python, arch, deps, and report no config).
     cfg_path = discover_config_path(args.config)
+    cfg: Config | None = None
     if cfg_path is None:
+        if args.command == "doctor":
+            return _cmd_doctor(None, None)
         sys.stderr.write(
             "No config found. Searched:\n"
             "  - --config <path>\n"
@@ -130,12 +141,21 @@ def main(argv: list[str] | None = None) -> NoReturn:
         cfg = load_config(cfg_path)
     except ConfigError as e:
         sys.stderr.write(f"config error: {e}\n")
+        if args.command == "doctor":
+            # Doctor can still report environment info.
+            return _cmd_doctor(None, cfg_path)
         sys.exit(2)
 
     sys.stderr.write(f"pg-mcp: loaded config from {cfg_path}\n")
 
     if args.command == "check":
         sys.exit(_cmd_check(cfg))
+
+    if args.command == "doctor":
+        sys.exit(_cmd_doctor(cfg, cfg_path))
+
+    if args.command == "info":
+        sys.exit(_cmd_info(cfg, args.name))
 
     if args.command == "serve":
         sys.exit(_cmd_serve(cfg))
@@ -172,6 +192,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Overwrite an existing file.",
     )
     sub.add_parser("check", help="Validate config and probe connections.")
+    sub.add_parser(
+        "doctor",
+        help="Diagnose environment, config, and connection issues with remedies.",
+    )
+    p_info = sub.add_parser(
+        "info",
+        help="Show detailed info (status, DSN, pool, grants) for a connection.",
+    )
+    p_info.add_argument("name", help="Connection name from config.")
     sub.add_parser("tools", help="Print the tool catalogue.")
     p_grants = sub.add_parser(
         "grants",
@@ -345,6 +374,84 @@ def _cmd_check(cfg: Config) -> int:
         "  claude mcp add --transport stdio pg-mcp -- pg-mcp serve\n"
     )
     return 0
+
+
+# ---------------------------------------------------------------------------
+# doctor
+
+
+def _cmd_doctor(cfg: Config | None, cfg_path: Path | None) -> int:
+    configure_logging_to_stderr(level="WARNING")
+    from pg_mcp.doctor import run_doctor
+
+    report = asyncio.run(run_doctor(cfg, cfg_path))
+    report.print()
+    if report.worst == "error":
+        return 2
+    if report.worst == "warn":
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# info
+
+
+def _cmd_info(cfg: Config, name: str) -> int:
+    conn_cfg = cfg.get(name)
+    if conn_cfg is None:
+        sys.stderr.write(f"Unknown connection: {name!r}\n")
+        sys.stderr.write("Known connections: " + ", ".join(c.name for c in cfg.connections) + "\n")
+        return 2
+
+    configure_logging_to_stderr(level="WARNING")
+    registry = ConnectionRegistry([conn_cfg])
+
+    async def _run() -> dict[str, str]:
+        await registry.open_all(probe=True)
+        entry = registry.get_entry(name)
+        pool_stats: dict[str, str] = {}
+        if entry.pool is not None:
+            try:
+                stats = entry.pool.get_stats()
+                pool_stats = {k: str(v) for k, v in stats.items()}
+            except Exception:
+                pool_stats = {}
+        await registry.close_all()
+        return {
+            "status": entry.status.value,
+            "last_error": entry.last_error or "",
+            **{f"pool.{k}": v for k, v in pool_stats.items()},
+        }
+
+    result = asyncio.run(_run())
+
+    from pg_mcp.connections import build_conninfo, redact_conninfo
+
+    sys.stderr.write(f"Connection: {name}\n")
+    sys.stderr.write(f"  Description: {conn_cfg.description or '(none)'}\n")
+    sys.stderr.write(f"  Status:      {result.get('status')}\n")
+    if result.get("last_error"):
+        sys.stderr.write(f"  Last error:  {result['last_error']}\n")
+    sys.stderr.write(f"  DSN:         {redact_conninfo(build_conninfo(conn_cfg))}\n")
+    sys.stderr.write(f"  Pool:        min={conn_cfg.pool.min_size}, max={conn_cfg.pool.max_size}\n")
+    if conn_cfg.allowed_schemas:
+        sys.stderr.write(f"  Allowed schemas: {', '.join(conn_cfg.allowed_schemas)}\n")
+    if conn_cfg.denied_schemas:
+        sys.stderr.write(f"  Denied schemas:  {', '.join(conn_cfg.denied_schemas)}\n")
+    if conn_cfg.search_path:
+        sys.stderr.write(f"  search_path: {', '.join(conn_cfg.search_path)}\n")
+    if conn_cfg.statement_timeout_ms:
+        sys.stderr.write(f"  Per-conn statement_timeout: {conn_cfg.statement_timeout_ms} ms\n")
+    if conn_cfg.row_limit:
+        sys.stderr.write(f"  Per-conn row_limit: {conn_cfg.row_limit}\n")
+
+    pool_stats = {k: v for k, v in result.items() if k.startswith("pool.")}
+    if pool_stats:
+        sys.stderr.write("  Pool stats:\n")
+        for k, v in pool_stats.items():
+            sys.stderr.write(f"    {k.removeprefix('pool.')}: {v}\n")
+    return 0 if result.get("status") == "available" else 1
 
 
 # ---------------------------------------------------------------------------
