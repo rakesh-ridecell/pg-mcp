@@ -265,18 +265,14 @@ class ConnectionRegistry:
         """
         entry = self.get_entry(name)
         if entry.status == ConnectionStatus.UNSAFE:
-            raise ConnectionUnsafeError(
-                f"connection {name!r} is marked UNSAFE: {entry.last_error}"
-            )
+            raise ConnectionUnsafeError(f"connection {name!r} is marked UNSAFE: {entry.last_error}")
         if entry.pool is None or entry.status != ConnectionStatus.AVAILABLE:
             raise ConnectionUnavailableError(
                 f"connection {name!r} is {entry.status.value}: {entry.last_error or 'unknown'}"
             )
         return entry.pool
 
-    async def await_pool(
-        self, name: str, *, timeout: float = 10.0
-    ) -> AsyncConnectionPool:
+    async def await_pool(self, name: str, *, timeout: float = 10.0) -> AsyncConnectionPool:
         """Return a usable pool, waiting up to *timeout* for PENDING to
         transition to AVAILABLE.
 
@@ -286,9 +282,7 @@ class ConnectionRegistry:
         """
         entry = self.get_entry(name)
         if entry.status == ConnectionStatus.UNSAFE:
-            raise ConnectionUnsafeError(
-                f"connection {name!r} is marked UNSAFE: {entry.last_error}"
-            )
+            raise ConnectionUnsafeError(f"connection {name!r} is marked UNSAFE: {entry.last_error}")
         if entry.status == ConnectionStatus.AVAILABLE and entry.pool is not None:
             return entry.pool
 
