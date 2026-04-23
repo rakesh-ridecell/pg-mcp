@@ -149,6 +149,12 @@ class ConnectionConfig(BaseModel):
     allowed_schemas: list[str] | None = None
     denied_schemas: list[str] | None = None
 
+    # Per-connection rate limit. If set, tools that hit the DB will
+    # refuse requests that exceed ``rate_limit_per_minute`` calls in a
+    # rolling 60-second window. Returns ``rate_limited`` error code.
+    # Protects prod replicas from runaway LLM loops.
+    rate_limit_per_minute: int | None = Field(default=None, ge=1, le=10_000)
+
     @field_validator("allowed_schemas", "denied_schemas")
     @classmethod
     def _validate_schema_lists(cls, v: list[str] | None) -> list[str] | None:

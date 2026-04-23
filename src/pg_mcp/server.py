@@ -28,17 +28,30 @@ from pg_mcp.introspect import (
     list_relations,
 )
 from pg_mcp.introspect import (
+    diff_schemas as _diff_schemas,
+)
+from pg_mcp.introspect import (
     list_schemas as _list_schemas,
+)
+from pg_mcp.introspect import (
+    related_tables as _related_tables,
 )
 from pg_mcp.introspect import (
     sample_rows as _sample_rows,
 )
 from pg_mcp.introspect import (
+    sample_rows_with_where as _sample_rows_with_where,
+)
+from pg_mcp.introspect import (
     search_schema as _search_schema,
+)
+from pg_mcp.introspect import (
+    slow_queries as _slow_queries,
 )
 from pg_mcp.introspect import (
     table_stats as _table_stats,
 )
+from pg_mcp.ratelimit import RateLimiter
 from pg_mcp.render import ColumnSpec, render_preamble, render_table
 from pg_mcp.runner import run_select
 from pg_mcp.safety import SchemaPolicy, assert_readonly
@@ -105,14 +118,23 @@ def _register_tools(
 ) -> None:
     defaults = config.defaults
 
-    # Build a SchemaPolicy per connection upfront.
+    # Build a SchemaPolicy + RateLimiter per connection upfront.
     schema_policies: dict[str, SchemaPolicy] = {
         c.name: SchemaPolicy(allowed=c.allowed_schemas, denied=c.denied_schemas)
         for c in config.connections
     }
+    rate_limiters: dict[str, RateLimiter] = {
+        c.name: RateLimiter(limit_per_minute=c.rate_limit_per_minute) for c in config.connections
+    }
 
     def _schema_policy(name: str) -> SchemaPolicy:
         return schema_policies.get(name, SchemaPolicy())
+
+    async def _rate_limit(name: str) -> None:
+        """Raise RateLimitedError if the connection is over its budget."""
+        limiter = rate_limiters.get(name)
+        if limiter is not None and limiter.enabled:
+            await limiter.check_and_record(name)
 
     ro_annotations = ToolAnnotations(
         readOnlyHint=True,
@@ -214,6 +236,7 @@ def _register_tools(
     async def list_schemas(connection: str, include_system: bool = False) -> str:
         rid = _rid()
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             rows = await _list_schemas(pool, include_system=include_system)
         except PgMcpError as e:
@@ -280,6 +303,7 @@ def _register_tools(
         _require_positive(limit, "limit", max_value=2000)
         _require_non_negative(offset, "offset")
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             rows, total = await list_relations(
                 pool,
@@ -366,6 +390,7 @@ def _register_tools(
         _require_positive(limit, "limit", max_value=2000)
         _require_non_negative(offset, "offset")
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             rows, total = await list_relations(
                 pool,
@@ -432,6 +457,7 @@ def _register_tools(
                 PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
             )
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             desc = await describe_table(pool, schema=schema, table=table)
         except PgMcpError as e:
@@ -504,6 +530,7 @@ def _register_tools(
                 PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
             )
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             desc = await describe_table(pool, schema=schema, table=view)
         except PgMcpError as e:
@@ -551,10 +578,13 @@ def _register_tools(
     @mcp.tool(
         name="sample_rows",
         description=(
-            "Return up to `limit` rows from a table or view. "
-            "Includes `table_estimated_rows` and `rls_enabled` in the "
-            "preamble so you can distinguish an empty table from an "
-            "RLS-filtered read."
+            "Return up to `limit` rows from a table or view. Optional "
+            "`where` parameter accepts a SQL WHERE clause (without the "
+            "'WHERE' keyword) to filter rows — fully validated through "
+            "the safety gate, so DML smuggling and deny-listed function "
+            "calls in the WHERE are rejected. Preamble includes "
+            "`table_estimated_rows` and `rls_enabled` so you can "
+            "distinguish empty from RLS-filtered."
         ),
         annotations=ro_annotations,
     )
@@ -563,6 +593,7 @@ def _register_tools(
         schema: str,
         table: str,
         limit: int = 20,
+        where: str | None = None,
     ) -> str:
         rid = _rid()
         try:
@@ -579,24 +610,40 @@ def _register_tools(
                 PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
             )
         _require_positive(limit, "limit", max_value=1000)
+        conn_cfg = config.get(connection)
+        timeout = (
+            conn_cfg.statement_timeout_ms
+            if conn_cfg and conn_cfg.statement_timeout_ms
+            else defaults.statement_timeout_ms
+        )
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
-            conn_cfg = config.get(connection)
-            timeout = (
-                conn_cfg.statement_timeout_ms
-                if conn_cfg and conn_cfg.statement_timeout_ms
-                else defaults.statement_timeout_ms
-            )
-            result, approx, rls = await _sample_rows(
-                pool,
-                schema=schema,
-                table=table,
-                limit=limit,
-                row_limit=limit,
-                byte_limit=defaults.byte_limit,
-                cell_limit=defaults.cell_limit,
-                timeout_ms=timeout,
-            )
+            if where:
+                result, approx, rls = await _sample_rows_with_where(
+                    pool,
+                    schema=schema,
+                    table=table,
+                    where=where,
+                    limit=limit,
+                    row_limit=limit,
+                    byte_limit=defaults.byte_limit,
+                    cell_limit=defaults.cell_limit,
+                    timeout_ms=timeout,
+                )
+            else:
+                result, approx, rls = await _sample_rows(
+                    pool,
+                    schema=schema,
+                    table=table,
+                    limit=limit,
+                    row_limit=limit,
+                    byte_limit=defaults.byte_limit,
+                    cell_limit=defaults.cell_limit,
+                    timeout_ms=timeout,
+                )
+        except PolicyViolation as e:
+            return _error_response(audit, rid, "sample_rows", connection, e)
         except PgMcpError as e:
             return _error_response(audit, rid, "sample_rows", connection, e)
 
@@ -666,6 +713,7 @@ def _register_tools(
             return _error_response(audit, rid, "run_query", connection, e, sql=sql)
 
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             result = await run_select(
                 pool,
@@ -749,6 +797,7 @@ def _register_tools(
             else defaults.statement_timeout_ms
         )
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             result = await run_select(
                 pool,
@@ -819,6 +868,7 @@ def _register_tools(
             )
 
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             hits = await _search_schema(pool, pattern=pattern, kind=kind, limit=limit)
         except PgMcpError as e:
@@ -877,6 +927,7 @@ def _register_tools(
                 PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
             )
         try:
+            await _rate_limit(connection)
             pool = await registry.await_pool(connection)
             stats = await _table_stats(pool, schema=schema, table=table)
         except PgMcpError as e:
@@ -925,6 +976,259 @@ def _register_tools(
                 "tool": "table_stats",
             },
             "\n".join(lines),
+        )
+
+    # -----------------------------------------------------------------
+    @mcp.tool(
+        name="related_tables",
+        description=(
+            "Walk the foreign-key graph for a table and return every "
+            "FK relationship touching it — both outgoing (this table "
+            "→ parent) and incoming (child → this table). The best "
+            "first call when figuring out what to JOIN to."
+        ),
+        annotations=ro_annotations,
+    )
+    async def related_tables_tool(connection: str, schema: str, table: str) -> str:
+        rid = _rid()
+        try:
+            _require_identifier(schema, "schema")
+            _require_identifier(table, "table")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "related_tables", connection, e)
+        if not _schema_policy(connection).is_allowed(schema):
+            return _error_response(
+                audit,
+                rid,
+                "related_tables",
+                connection,
+                PolicyViolation("disallowed_schema", f"schema {schema!r} is not permitted"),
+            )
+        try:
+            await _rate_limit(connection)
+            pool = await registry.await_pool(connection)
+            rels = await _related_tables(pool, schema=schema, table=table)
+        except PgMcpError as e:
+            return _error_response(audit, rid, "related_tables", connection, e)
+
+        audit.tool_call(
+            request_id=rid,
+            tool="related_tables",
+            connection=connection,
+            params={"schema": schema, "table": table},
+            rows_returned=len(rels),
+        )
+        if not rels:
+            return _wrap(
+                {
+                    "connection": connection,
+                    "schema": schema,
+                    "table": table,
+                    "tool": "related_tables",
+                    "rows_returned": 0,
+                },
+                f"No foreign-key relationships found for `{schema}.{table}`.",
+            )
+        lines = [
+            "| direction | local cols | → | other table | other cols | on update | on delete |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for rel in rels:
+            arrow = "→" if rel.direction == "outgoing" else "←"
+            lines.append(
+                "| {d} | ({lc}) | {a} | `{ot}` | ({oc}) | {ou} | {od} |".format(
+                    d=rel.direction,
+                    lc=", ".join(rel.local_columns),
+                    a=arrow,
+                    ot=f"{rel.other_schema}.{rel.other_table}",
+                    oc=", ".join(rel.other_columns),
+                    ou=rel.on_update or "NO ACTION",
+                    od=rel.on_delete or "NO ACTION",
+                )
+            )
+        return _wrap(
+            {
+                "connection": connection,
+                "schema": schema,
+                "table": table,
+                "rows_returned": len(rels),
+                "tool": "related_tables",
+            },
+            "\n".join(lines),
+        )
+
+    # -----------------------------------------------------------------
+    @mcp.tool(
+        name="slow_queries",
+        description=(
+            "Top slow queries from `pg_stat_statements` (must be "
+            "installed on the DB). Useful for performance work. "
+            "Returns query text, call count, mean/total/max execution "
+            "time in ms, and rows affected."
+        ),
+        annotations=ro_annotations,
+    )
+    async def slow_queries_tool(
+        connection: str,
+        limit: int = 20,
+        min_mean_ms: float = 0.0,
+    ) -> str:
+        rid = _rid()
+        _require_positive(limit, "limit", max_value=200)
+        if min_mean_ms < 0:
+            return _error_response(
+                audit,
+                rid,
+                "slow_queries",
+                connection,
+                ToolInputError("min_mean_ms must be >= 0"),
+            )
+        try:
+            await _rate_limit(connection)
+            pool = await registry.await_pool(connection)
+            results = await _slow_queries(pool, limit=limit, min_mean_ms=min_mean_ms)
+        except PgMcpError as e:
+            return _error_response(audit, rid, "slow_queries", connection, e)
+
+        if results is None:
+            audit.tool_call(
+                request_id=rid,
+                tool="slow_queries",
+                connection=connection,
+                params={"limit": limit, "min_mean_ms": min_mean_ms},
+                status="error",
+                error_code="extension_missing",
+            )
+            return _wrap(
+                {
+                    "connection": connection,
+                    "tool": "slow_queries",
+                    "error": "extension_missing",
+                },
+                "`pg_stat_statements` is not installed on this database. "
+                "Ask a DBA to `CREATE EXTENSION pg_stat_statements;` "
+                "(requires superuser + shared_preload_libraries).",
+            )
+
+        audit.tool_call(
+            request_id=rid,
+            tool="slow_queries",
+            connection=connection,
+            params={"limit": limit, "min_mean_ms": min_mean_ms},
+            rows_returned=len(results),
+        )
+        lines = [
+            "| calls | mean ms | total ms | max ms | rows | query |",
+            "|---|---|---|---|---|---|",
+        ]
+        for q in results:
+            # Preview the query — compact whitespace + truncate.
+            query_text = " ".join(q.query_text.split())
+            if len(query_text) > 140:
+                query_text = query_text[:139] + "…"
+            query_text = query_text.replace("|", "\\|")
+            lines.append(
+                f"| {q.calls} | {q.mean_exec_time_ms:.1f} | "
+                f"{q.total_exec_time_ms:.1f} | {q.max_exec_time_ms:.1f} | "
+                f"{q.rows} | `{query_text}` |"
+            )
+        return _wrap(
+            {
+                "connection": connection,
+                "rows_returned": len(results),
+                "tool": "slow_queries",
+            },
+            "\n".join(lines),
+        )
+
+    # -----------------------------------------------------------------
+    @mcp.tool(
+        name="diff_schemas",
+        description=(
+            "Compare two schemas in the same database: which tables "
+            "exist in only one, and for common tables, which columns "
+            "differ in type / nullable / default. Great for "
+            "prod-vs-staging migration work."
+        ),
+        annotations=ro_annotations,
+    )
+    async def diff_schemas_tool(
+        connection: str,
+        schema_a: str,
+        schema_b: str,
+    ) -> str:
+        rid = _rid()
+        try:
+            _require_identifier(schema_a, "schema_a")
+            _require_identifier(schema_b, "schema_b")
+        except ToolInputError as e:
+            return _error_response(audit, rid, "diff_schemas", connection, e)
+        policy = _schema_policy(connection)
+        for s in (schema_a, schema_b):
+            if not policy.is_allowed(s):
+                return _error_response(
+                    audit,
+                    rid,
+                    "diff_schemas",
+                    connection,
+                    PolicyViolation("disallowed_schema", f"schema {s!r} is not permitted"),
+                )
+        try:
+            await _rate_limit(connection)
+            pool = await registry.await_pool(connection)
+            diff = await _diff_schemas(pool, schema_a=schema_a, schema_b=schema_b)
+        except PgMcpError as e:
+            return _error_response(audit, rid, "diff_schemas", connection, e)
+
+        audit.tool_call(
+            request_id=rid,
+            tool="diff_schemas",
+            connection=connection,
+            params={"schema_a": schema_a, "schema_b": schema_b},
+        )
+        sections = [f"## Diff: `{schema_a}` ↔ `{schema_b}`"]
+        if diff.only_in_a:
+            sections.append(f"### Only in `{schema_a}`")
+            sections.extend(f"- `{t}`" for t in diff.only_in_a)
+        if diff.only_in_b:
+            sections.append(f"### Only in `{schema_b}`")
+            sections.extend(f"- `{t}`" for t in diff.only_in_b)
+        if diff.common_tables_with_differences:
+            sections.append("### Common tables with differences")
+            for entry in diff.common_tables_with_differences:
+                sections.append(f"#### `{entry['table']}`")
+                if entry.get("columns_only_in_a"):
+                    sections.append(
+                        f"- columns only in `{schema_a}`: "
+                        + ", ".join(f"`{c}`" for c in entry["columns_only_in_a"])
+                    )
+                if entry.get("columns_only_in_b"):
+                    sections.append(
+                        f"- columns only in `{schema_b}`: "
+                        + ", ".join(f"`{c}`" for c in entry["columns_only_in_b"])
+                    )
+                if entry.get("columns_changed"):
+                    for ch in entry["columns_changed"]:
+                        sections.append(
+                            f"- `{ch['column']}`: "
+                            f"{schema_a}=({ch['a']['type']}, nullable={ch['a']['nullable']}, "
+                            f"default={ch['a']['default']}) "
+                            f"vs {schema_b}=({ch['b']['type']}, nullable={ch['b']['nullable']}, "
+                            f"default={ch['b']['default']})"
+                        )
+        if not diff.only_in_a and not diff.only_in_b and not diff.common_tables_with_differences:
+            sections.append("**Schemas are structurally identical.**")
+        return _wrap(
+            {
+                "connection": connection,
+                "schema_a": schema_a,
+                "schema_b": schema_b,
+                "only_in_a": len(diff.only_in_a),
+                "only_in_b": len(diff.only_in_b),
+                "differences": len(diff.common_tables_with_differences),
+                "tool": "diff_schemas",
+            },
+            "\n".join(sections),
         )
 
 

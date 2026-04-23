@@ -53,6 +53,12 @@ class PoolExhaustedError(PgMcpError):
     code = "connection_pool_exhausted"
 
 
+class RateLimitedError(PgMcpError):
+    """Raised when a connection's per-minute rate limit is exceeded."""
+
+    code = "rate_limited"
+
+
 class PolicyViolation(PgMcpError):  # noqa: N818 — "Violation" is idiomatic for policy errors
     """The SQL was rejected by the safety policy without reaching Postgres.
 
@@ -99,6 +105,7 @@ __all__ = [
     "PoolExhaustedError",
     "PostgresError",
     "QueryTimeoutError",
+    "RateLimitedError",
     "ResultTooLargeError",
     "ToolInputError",
     "UnknownConnectionError",

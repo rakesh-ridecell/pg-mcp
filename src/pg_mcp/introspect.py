@@ -824,18 +824,372 @@ async def table_stats(pool: AsyncConnectionPool, *, schema: str, table: str) -> 
     )
 
 
+# ---------------------------------------------------------------------------
+# related_tables
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RelatedTable:
+    direction: str  # 'outgoing' (this table -> other) or 'incoming' (other -> this)
+    constraint_name: str
+    local_columns: list[str]
+    other_schema: str
+    other_table: str
+    other_columns: list[str]
+    on_update: str
+    on_delete: str
+
+
+async def related_tables(
+    pool: AsyncConnectionPool,
+    *,
+    schema: str,
+    table: str,
+) -> list[RelatedTable]:
+    """Return the FK relationships touching *schema.table*.
+
+    Includes outgoing FKs (this table references another) and incoming
+    FKs (another table references this). This is the primary "what
+    can I join to?" lookup for query drafting.
+    """
+    sql = pg_sql.SQL(
+        """
+        SELECT
+            CASE WHEN c.conrelid = t.oid THEN 'outgoing' ELSE 'incoming' END AS direction,
+            c.conname,
+            -- Local columns (on the side of *this* table)
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(
+                    CASE WHEN c.conrelid = t.oid THEN c.conkey ELSE c.confkey END
+                ) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_catalog.pg_attribute a
+                  ON a.attrelid = t.oid AND a.attnum = k.attnum
+                ORDER BY k.ord
+            ) AS local_cols,
+            other_ns.nspname AS other_schema,
+            other.relname AS other_table,
+            -- Columns on the other side
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(
+                    CASE WHEN c.conrelid = t.oid THEN c.confkey ELSE c.conkey END
+                ) WITH ORDINALITY AS k(attnum, ord)
+                JOIN pg_catalog.pg_attribute a
+                  ON a.attrelid = other.oid AND a.attnum = k.attnum
+                ORDER BY k.ord
+            ) AS other_cols,
+            c.confupdtype,
+            c.confdeltype
+        FROM pg_catalog.pg_class t
+        JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_catalog.pg_constraint c
+          ON c.contype = 'f'
+         AND (c.conrelid = t.oid OR c.confrelid = t.oid)
+        JOIN pg_catalog.pg_class other
+          ON other.oid = CASE WHEN c.conrelid = t.oid THEN c.confrelid ELSE c.conrelid END
+        JOIN pg_catalog.pg_namespace other_ns ON other_ns.oid = other.relnamespace
+        WHERE n.nspname = {schema} AND t.relname = {table}
+        ORDER BY direction, c.conname
+        """
+    ).format(schema=_lit(schema), table=_lit(table))
+    rows = await _run_catalog_sql(pool, sql)
+    return [
+        RelatedTable(
+            direction=r[0],
+            constraint_name=r[1],
+            local_columns=list(r[2] or ()),
+            other_schema=r[3],
+            other_table=r[4],
+            other_columns=list(r[5] or ()),
+            on_update=_fk_action(r[6]),
+            on_delete=_fk_action(r[7]),
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# slow_queries (requires pg_stat_statements extension)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SlowQuery:
+    query_text: str
+    calls: int
+    total_exec_time_ms: float
+    mean_exec_time_ms: float
+    max_exec_time_ms: float
+    rows: int
+    userid: int | None
+
+
+async def slow_queries(
+    pool: AsyncConnectionPool,
+    *,
+    limit: int = 20,
+    min_mean_ms: float = 0.0,
+) -> list[SlowQuery] | None:
+    """Return the top slow queries from ``pg_stat_statements``.
+
+    Returns ``None`` if the extension isn't installed (so callers can
+    surface a specific ``extension_missing`` error to the LLM instead
+    of a generic Postgres error).
+    """
+    ext_check_sql = "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'"
+    ext_rows = await _run_catalog_sql(pool, ext_check_sql)
+    if not ext_rows:
+        return None
+
+    sql = pg_sql.SQL(
+        """
+        SELECT
+            pss.query,
+            pss.calls,
+            pss.total_exec_time,
+            pss.mean_exec_time,
+            pss.max_exec_time,
+            pss.rows,
+            pss.userid::int
+        FROM pg_stat_statements pss
+        WHERE pss.mean_exec_time >= {min_mean}
+        ORDER BY pss.mean_exec_time DESC
+        LIMIT {lim}
+        """
+    ).format(min_mean=_lit(min_mean_ms), lim=_lit(limit))
+    rows = await _run_catalog_sql(pool, sql)
+    return [
+        SlowQuery(
+            query_text=_as_str_or_none(r[0]) or "",
+            calls=_as_int(r[1]) or 0,
+            total_exec_time_ms=float(r[2]) if r[2] is not None else 0.0,
+            mean_exec_time_ms=float(r[3]) if r[3] is not None else 0.0,
+            max_exec_time_ms=float(r[4]) if r[4] is not None else 0.0,
+            rows=_as_int(r[5]) or 0,
+            userid=_as_int(r[6]),
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# diff_schemas
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SchemaDiff:
+    """A structural diff between two schemas.
+
+    ``tables_only_in_a`` and ``tables_only_in_b`` list names. For tables
+    present in both, ``columns_changed`` lists those with mismatched
+    type / nullable / default.
+    """
+
+    only_in_a: list[str]
+    only_in_b: list[str]
+    common_tables_with_differences: list[dict]
+
+
+async def diff_schemas(
+    pool: AsyncConnectionPool,
+    *,
+    schema_a: str,
+    schema_b: str,
+) -> SchemaDiff:
+    """Compare the structure of two schemas in the same database.
+
+    Cross-database diff would require connecting to two pools; for now
+    this is intra-DB only. The comparison looks at table presence and,
+    for common tables, per-column type + nullable + default equality.
+    """
+    tables_sql = pg_sql.SQL(
+        """
+        SELECT n.nspname, c.relname
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ({a}, {b})
+          AND c.relkind IN ('r', 'p', 'f')
+        ORDER BY n.nspname, c.relname
+        """
+    ).format(a=_lit(schema_a), b=_lit(schema_b))
+
+    columns_sql = pg_sql.SQL(
+        """
+        SELECT
+            n.nspname,
+            c.relname,
+            a.attnum,
+            a.attname,
+            pg_catalog.format_type(a.atttypid, a.atttypmod),
+            NOT a.attnotnull AS nullable,
+            pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_catalog.pg_attrdef d
+               ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE n.nspname IN ({a}, {b})
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND c.relkind IN ('r', 'p', 'f')
+        ORDER BY n.nspname, c.relname, a.attnum
+        """
+    ).format(a=_lit(schema_a), b=_lit(schema_b))
+
+    async with _catalog_session(pool) as cur:
+        table_rows = await _fetchall(cur, tables_sql)
+        col_rows = await _fetchall(cur, columns_sql)
+
+    tables_a: set[str] = set()
+    tables_b: set[str] = set()
+    for r in table_rows:
+        (tables_a if r[0] == schema_a else tables_b).add(r[1])
+
+    only_a = sorted(tables_a - tables_b)
+    only_b = sorted(tables_b - tables_a)
+    common = sorted(tables_a & tables_b)
+
+    # Index columns by (schema, table, colname).
+    col_index_a: dict[tuple[str, str], dict[str, tuple]] = {}
+    col_index_b: dict[tuple[str, str], dict[str, tuple]] = {}
+    for r in col_rows:
+        schema_name, table_name, _attnum, colname, type_, nullable, default = r
+        key = (str(schema_name), str(table_name))
+        value = (str(type_), bool(nullable), default)
+        idx = col_index_a if schema_name == schema_a else col_index_b
+        idx.setdefault(key, {})[str(colname)] = value
+
+    differences: list[dict] = []
+    for table in common:
+        cols_a = col_index_a.get((schema_a, table), {})
+        cols_b = col_index_b.get((schema_b, table), {})
+        table_diffs: dict = {}
+        missing_in_b = sorted(set(cols_a) - set(cols_b))
+        missing_in_a = sorted(set(cols_b) - set(cols_a))
+        changed = []
+        for col in sorted(set(cols_a) & set(cols_b)):
+            if cols_a[col] != cols_b[col]:
+                changed.append(
+                    {
+                        "column": col,
+                        "a": {
+                            "type": cols_a[col][0],
+                            "nullable": cols_a[col][1],
+                            "default": cols_a[col][2],
+                        },
+                        "b": {
+                            "type": cols_b[col][0],
+                            "nullable": cols_b[col][1],
+                            "default": cols_b[col][2],
+                        },
+                    }
+                )
+        if missing_in_a or missing_in_b or changed:
+            table_diffs["table"] = table
+            if missing_in_b:
+                table_diffs["columns_only_in_a"] = missing_in_b
+            if missing_in_a:
+                table_diffs["columns_only_in_b"] = missing_in_a
+            if changed:
+                table_diffs["columns_changed"] = changed
+            differences.append(table_diffs)
+
+    return SchemaDiff(
+        only_in_a=only_a,
+        only_in_b=only_b,
+        common_tables_with_differences=differences,
+    )
+
+
+# ---------------------------------------------------------------------------
+# sample_rows with WHERE — extends existing sample_rows
+# ---------------------------------------------------------------------------
+
+
+async def sample_rows_with_where(
+    pool: AsyncConnectionPool,
+    *,
+    schema: str,
+    table: str,
+    where: str,
+    limit: int,
+    row_limit: int,
+    byte_limit: int,
+    cell_limit: int,
+    timeout_ms: int,
+) -> tuple[QueryResult, int | None, bool]:
+    """Sample rows filtered by a user-supplied WHERE clause.
+
+    The WHERE clause text is embedded in ``SELECT * FROM s.t WHERE
+    <where> LIMIT N`` and the full query is validated by the safety
+    gate before execution — this catches DML smuggling (e.g., a WHERE
+    containing ``CASE WHEN ... THEN (DELETE FROM ...)``) and
+    deny-listed functions (e.g., ``WHERE pg_advisory_lock(1) = true``).
+    """
+    from pg_mcp.safety import assert_readonly
+
+    info_sql = pg_sql.SQL(
+        "SELECT c.reltuples::bigint, c.relrowsecurity "
+        "FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = {schema} AND c.relname = {table}"
+    ).format(schema=_lit(schema), table=_lit(table))
+    info_rows = await _run_catalog_sql(pool, info_sql)
+    approx_rows: int | None = None
+    rls = False
+    if info_rows:
+        approx_rows = _as_int(info_rows[0][0])
+        rls = _as_bool(info_rows[0][1])
+
+    qualified = pg_sql.Identifier(schema) + pg_sql.SQL(".") + pg_sql.Identifier(table)
+    effective_limit = min(limit, row_limit)
+
+    # The WHERE clause can't be parameterized via pg_sql.Literal because
+    # it's arbitrary SQL. Instead we construct the full statement and
+    # validate it through the safety gate, which is exactly what
+    # run_query does — this is identical safety.
+    full_sql = (
+        pg_sql.SQL("SELECT * FROM {ident} WHERE ")
+        .format(ident=qualified)
+        .as_string(psycopg.adapters)
+        + where
+        + f" LIMIT {int(effective_limit)}"
+    )
+    assert_readonly(full_sql)
+
+    result = await run_select(
+        pool,
+        full_sql,
+        row_limit=effective_limit,
+        byte_limit=byte_limit,
+        cell_limit=cell_limit,
+        timeout_ms=timeout_ms,
+    )
+    return result, approx_rows, rls
+
+
 __all__ = [
     "ColumnInfo",
     "ConstraintInfo",
     "ForeignKeyInfo",
     "IndexInfo",
+    "RelatedTable",
+    "SchemaDiff",
     "SearchHit",
+    "SlowQuery",
     "TableDescription",
     "TableStats",
     "describe_table",
+    "diff_schemas",
     "list_relations",
     "list_schemas",
+    "related_tables",
     "sample_rows",
+    "sample_rows_with_where",
     "search_schema",
+    "slow_queries",
     "table_stats",
 ]

@@ -118,6 +118,9 @@ def test_stdio_handshake_and_tool_list(dead_config: Path) -> None:
             "explain_query",
             "search_schema",
             "table_stats",
+            "related_tables",
+            "slow_queries",
+            "diff_schemas",
         }, f"unexpected tool set: {names}"
 
         # list_connections must respond even though the only connection
