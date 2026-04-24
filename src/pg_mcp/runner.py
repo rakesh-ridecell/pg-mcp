@@ -87,7 +87,23 @@ async def run_select(
                         started=started,
                     )
             except psycopg.errors.QueryCanceled as e:
-                raise QueryTimeoutError(f"statement_timeout after {timeout_ms}ms: {e}") from e
+                # Build an actionable error message. The LLM sees this
+                # and should be able to retry with a narrower query.
+                elapsed_s = time.perf_counter() - started
+                hint = (
+                    f"Query exceeded statement_timeout of {timeout_ms}ms "
+                    f"(ran for {elapsed_s:.1f}s before cancellation). "
+                    "Tips: "
+                    "(a) For COUNT(*)/MIN/MAX on large tables, "
+                    "use `table_stats` — it returns approximate row count "
+                    "without a scan. "
+                    "(b) For slow selects, run `explain_query` first to see the plan "
+                    "and check for missing indexes. "
+                    "(c) Add a narrower WHERE clause or a LIMIT. "
+                    "(d) If the query must run, ask the operator to raise "
+                    "`statement_timeout_ms` in the connection config."
+                )
+                raise QueryTimeoutError(hint) from e
             except psycopg.Error as e:
                 sqlstate = getattr(e, "sqlstate", None)
                 raise PostgresError(str(e), sqlstate=sqlstate) from e

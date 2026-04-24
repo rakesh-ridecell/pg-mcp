@@ -224,6 +224,56 @@ def _register_tools(
 
     # -----------------------------------------------------------------
     @mcp.tool(
+        name="cancel_query",
+        description=(
+            "Cancel any in-flight queries that pg-mcp is running on a "
+            "connection, without tearing down the pool. Use this when a "
+            "previous `run_query` or `explain_query` timed out on the "
+            "client side but the server is still executing it — a "
+            "lighter-weight alternative to `reconnect`. Uses "
+            "`pg_cancel_backend` under the hood. Returns the number of "
+            "backends signalled (0 is a fine outcome — it just means "
+            "nothing was running)."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def cancel_query(connection: str) -> str:
+        rid = _rid()
+        try:
+            n = await registry.cancel_in_flight(connection)
+        except PgMcpError as e:
+            return _error_response(audit, rid, "cancel_query", connection, e)
+        except Exception as e:
+            return _error_response(
+                audit,
+                rid,
+                "cancel_query",
+                connection,
+                ToolInputError(f"cancel failed: {type(e).__name__}: {e}"),
+            )
+        audit.tool_call(
+            request_id=rid,
+            tool="cancel_query",
+            connection=connection,
+            params={},
+            rows_returned=n,
+        )
+        return _wrap(
+            {
+                "connection": connection,
+                "cancelled_backends": n,
+                "tool": "cancel_query",
+            },
+            f"Signalled {n} in-flight pg-mcp backend(s) on `{connection}`.",
+        )
+
+    # -----------------------------------------------------------------
+    @mcp.tool(
         name="list_schemas",
         description=(
             "List schemas visible to the read-only role. "
@@ -1377,6 +1427,17 @@ def _format_describe(desc: Any) -> str:
         f"total size `{_human_bytes(desc.total_bytes)}` — "
         f"RLS `{'enabled' if desc.rls_enabled else 'disabled'}`"
     )
+    # Warn loudly on large tables. An LLM about to write
+    # `SELECT COUNT(*)` or `COUNT(DISTINCT)` against tens of millions
+    # of rows will time out — this gives it the hint to use
+    # `table_stats` or add a LIMIT.
+    if desc.approximate_rows is not None and desc.approximate_rows >= 10_000_000:
+        lines.append(
+            f"- ⚠️  **Large table ({desc.approximate_rows:,} rows).** "
+            "Aggregations (`COUNT(*)`, `COUNT(DISTINCT)`, `MIN`/`MAX` without an index) "
+            "will likely hit `statement_timeout`. Prefer `table_stats` for row counts "
+            "and add `LIMIT` or a selective `WHERE` on indexed columns."
+        )
     if desc.inherits_from:
         lines.append("- Inherits from: " + ", ".join(f"`{p}`" for p in desc.inherits_from))
     if desc.partition_strategy:

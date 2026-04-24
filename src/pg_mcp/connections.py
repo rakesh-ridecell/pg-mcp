@@ -99,6 +99,49 @@ def redact_conninfo(conninfo: str) -> str:
     return psycopg.conninfo.make_conninfo(**d)
 
 
+async def _cancel_backends(entry: ConnectionEntry) -> int:
+    """Cancel every pg-mcp backend currently running a query.
+
+    Opens a short-lived side connection (bypassing the pool so we're
+    not contending with the very connections we're trying to cancel)
+    and runs ``pg_cancel_backend(pid)`` on each active query whose
+    ``application_name`` is ``'pg-mcp'`` and whose ``state`` is
+    ``'active'``.
+
+    Returns the number of backends targeted. Errors are caller's
+    responsibility — we don't want to swallow them silently *here*
+    because the caller may want to log them.
+    """
+    conninfo = build_conninfo(entry.config)
+    async with (
+        await psycopg.AsyncConnection.connect(conninfo, autocommit=True, connect_timeout=3) as side,
+        side.cursor() as cur,
+    ):
+        # Find pg-mcp's own active backends on this DB.
+        await cur.execute(
+            """
+                SELECT pid FROM pg_stat_activity
+                WHERE application_name = 'pg-mcp'
+                  AND state = 'active'
+                  AND pid <> pg_backend_pid()
+                """
+        )
+        pids = [int(r[0]) for r in await cur.fetchall()]
+        cancelled = 0
+        for pid in pids:
+            try:
+                await cur.execute("SELECT pg_cancel_backend(%s)", (pid,))
+                cancelled += 1
+            except Exception as e:
+                logger.warning(
+                    "pg_cancel_backend(%s) failed for %s: %s",
+                    pid,
+                    entry.config.name,
+                    e,
+                )
+    return cancelled
+
+
 async def _configure_conn(conn: AsyncConnection) -> None:
     """Pool configure hook: belt-and-braces RO + app_name for every backend.
 
@@ -166,13 +209,24 @@ class ConnectionRegistry:
     ) -> ConnectionEntry:
         """Close the existing pool (if any) for *name* and open a fresh one.
 
-        Used by the ``reconnect`` tool and by operators via ``pg-mcp
-        doctor``. Blocks until the re-probe has completed.
+        Before closing we cancel any in-flight pg-mcp backends so
+        ``pool.close()`` doesn't block waiting for a stuck query. The
+        close itself also has a short timeout as a second line of
+        defense. Blocks until the re-probe has completed.
         """
         entry = self.get_entry(name)
-        await self._close_one(entry)
+        await self._close_one(entry, timeout=3.0, cancel_in_flight=True)
         await self._open_one(entry, probe=True, timeout=timeout)
         return entry
+
+    async def cancel_in_flight(self, name: str) -> int:
+        """Cancel every pg-mcp backend currently running a query on *name*.
+
+        Returns the number of backends signalled. Does not tear down
+        the pool — existing idle connections remain usable.
+        """
+        entry = self.get_entry(name)
+        return await _cancel_backends(entry)
 
     def open_all_background(
         self,
@@ -264,11 +318,31 @@ class ConnectionRegistry:
                 # No probe → assume available once the pool is open.
                 entry.status = ConnectionStatus.AVAILABLE
 
-    async def _close_one(self, entry: ConnectionEntry) -> None:
+    async def _close_one(
+        self,
+        entry: ConnectionEntry,
+        *,
+        timeout: float = 5.0,
+        cancel_in_flight: bool = False,
+    ) -> None:
         async with entry._lock:
             if entry.pool is not None:
+                if cancel_in_flight:
+                    # Best-effort: before closing the pool, cancel any
+                    # backends pg-mcp has running on this DB. Uses a
+                    # fresh side-connection with a short timeout so it
+                    # can't itself hang the shutdown. Skips silently on
+                    # any error — the main pool.close() will still run.
+                    try:
+                        await _cancel_backends(entry)
+                    except Exception as e:
+                        logger.warning(
+                            "cancel_backends failed for %s: %s",
+                            entry.config.name,
+                            e,
+                        )
                 try:
-                    await entry.pool.close()
+                    await entry.pool.close(timeout=timeout)
                 except Exception as e:  # pragma: no cover - best effort
                     logger.warning("error closing pool %s: %s", entry.config.name, e)
                 entry.pool = None

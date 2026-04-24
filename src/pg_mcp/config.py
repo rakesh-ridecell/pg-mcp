@@ -106,7 +106,14 @@ class PoolSettings(BaseModel):
 
 
 class Defaults(BaseModel):
-    statement_timeout_ms: int = Field(default=30_000, ge=100, le=600_000)
+    # Default to 25s: must be LESS than the MCP client's per-tool-call
+    # timeout (Claude Code / OpenCode typically ~30s) so the server
+    # returns a clean `query_timeout` error with the query cancelled
+    # cleanly, rather than the client giving up first and leaving the
+    # backend running. If your MCP client has a longer timeout and you
+    # want more expensive queries to succeed, raise this in config
+    # (max 600_000 ms).
+    statement_timeout_ms: int = Field(default=25_000, ge=100, le=600_000)
     row_limit: int = Field(default=1000, ge=1, le=100_000)
     byte_limit: int = Field(default=1_048_576, ge=1024, le=100 * 1024 * 1024)
     cell_limit: int = Field(default=8192, ge=64)

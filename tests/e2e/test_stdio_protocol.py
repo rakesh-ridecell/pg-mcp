@@ -108,6 +108,7 @@ def test_stdio_handshake_and_tool_list(dead_config: Path) -> None:
         assert names == {
             "list_connections",
             "reconnect",
+            "cancel_query",
             "list_schemas",
             "list_tables",
             "list_views",
