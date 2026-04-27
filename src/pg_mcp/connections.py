@@ -2,14 +2,17 @@
 
 The registry is the sole owner of pool lifecycle. Tools ask it for a
 pool by name; the pool's ``configure`` hook pins
-``default_transaction_read_only = on`` and sets a recognizable
-``application_name`` for every new backend.
+``default_transaction_read_only = on`` and sets a per-process
+``application_name`` (``pg-mcp/<pid>``) for every new backend so
+multiple parallel pg-mcp processes (e.g., one per OpenCode session)
+can identify their own backends without stepping on each other's.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -25,6 +28,15 @@ from pg_mcp.errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Unique per-process tag we set as Postgres ``application_name`` on every
+# pooled backend. Made unique by PID so two parallel pg-mcp processes
+# (e.g., one per OpenCode/Claude Code session) can find their own
+# backends in pg_stat_activity without affecting each other's. The
+# ``pg-mcp/`` prefix lets operators see at a glance which backends are
+# from this tool when running ``SELECT * FROM pg_stat_activity``.
+APPLICATION_NAME = f"pg-mcp/{os.getpid()}"
 
 
 class ConnectionStatus(StrEnum):
@@ -105,8 +117,13 @@ async def _cancel_backends(entry: ConnectionEntry) -> int:
     Opens a short-lived side connection (bypassing the pool so we're
     not contending with the very connections we're trying to cancel)
     and runs ``pg_cancel_backend(pid)`` on each active query whose
-    ``application_name`` is ``'pg-mcp'`` and whose ``state`` is
-    ``'active'``.
+    ``application_name`` is *this process's* unique tag.
+
+    Critically we match on ``application_name = 'pg-mcp/<our_pid>'``,
+    not on a ``LIKE 'pg-mcp/%'``. This means two parallel pg-mcp
+    processes (e.g., one per OpenCode/Claude Code session) cannot
+    cancel each other's queries — a ``reconnect`` in one session no
+    longer interrupts running queries in any other session.
 
     Returns the number of backends targeted. Errors are caller's
     responsibility — we don't want to swallow them silently *here*
@@ -117,14 +134,15 @@ async def _cancel_backends(entry: ConnectionEntry) -> int:
         await psycopg.AsyncConnection.connect(conninfo, autocommit=True, connect_timeout=3) as side,
         side.cursor() as cur,
     ):
-        # Find pg-mcp's own active backends on this DB.
+        # Find THIS process's own active backends on this DB.
         await cur.execute(
             """
                 SELECT pid FROM pg_stat_activity
-                WHERE application_name = 'pg-mcp'
+                WHERE application_name = %s
                   AND state = 'active'
                   AND pid <> pg_backend_pid()
-                """
+                """,
+            (APPLICATION_NAME,),
         )
         pids = [int(r[0]) for r in await cur.fetchall()]
         cancelled = 0
@@ -154,7 +172,9 @@ async def _configure_conn(conn: AsyncConnection) -> None:
     # use literal SQL. The app_name is hard-coded and safe.
     async with conn.cursor() as cur:
         await cur.execute("SET default_transaction_read_only = on")
-        await cur.execute("SET application_name = 'pg-mcp'")
+        # Use the per-process unique tag so two pg-mcp processes don't
+        # collide (see APPLICATION_NAME docstring).
+        await cur.execute(f"SET application_name = '{APPLICATION_NAME}'")
     await conn.commit()
 
 

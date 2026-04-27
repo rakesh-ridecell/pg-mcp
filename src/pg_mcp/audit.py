@@ -10,6 +10,13 @@ written to disk:
 - ``hash``     — SHA-256 hash + 200-char preview. Safe default.
 - ``redacted`` — SQL with string/numeric literals replaced by ``?``.
 - ``full``     — full SQL. Opt-in only; documented as a PII risk.
+
+Multiple pg-mcp processes (e.g., one per OpenCode session) all write
+to the same default log file. Single-line appends are atomic on
+POSIX so entries don't interleave, but rotation isn't coordinated
+across processes — under heavy load the older rotated files may lose
+a few lines. Every entry includes a ``pid`` field so you can filter
+by source process: ``jq 'select(.pid == 12345)' pg-mcp.log``.
 """
 
 from __future__ import annotations
@@ -26,6 +33,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 LogSqlMode = Literal["hash", "redacted", "full"]
+
+# Cached at module-load time. Used to demux multi-process logs.
+_PID = os.getpid()
 
 _LITERAL_RE = re.compile(
     r"""
@@ -164,6 +174,7 @@ class AuditLogger:
     ) -> None:
         entry: dict[str, Any] = {
             "ts": _utc_now(),
+            "pid": _PID,
             "event": "tool_call",
             "request_id": request_id,
             "tool": tool,
@@ -185,6 +196,7 @@ class AuditLogger:
         self._emit(
             {
                 "ts": _utc_now(),
+                "pid": _PID,
                 "event": "startup",
                 "message": message,
                 **extra,
@@ -196,6 +208,7 @@ class AuditLogger:
         self._emit(
             {
                 "ts": _utc_now(),
+                "pid": _PID,
                 "event": "shutdown",
                 "message": message,
                 **extra,
@@ -207,6 +220,7 @@ class AuditLogger:
         self._emit(
             {
                 "ts": _utc_now(),
+                "pid": _PID,
                 "event": "error",
                 "message": message,
                 **extra,
@@ -223,6 +237,7 @@ class AuditLogger:
             line = json.dumps(
                 {
                     "ts": _utc_now(),
+                    "pid": _PID,
                     "event": "log_encoding_failure",
                     "error": str(e),
                 }
