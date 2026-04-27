@@ -302,6 +302,17 @@ class ConnectionRegistry:
                     max_size=entry.config.pool.max_size,
                     kwargs={"autocommit": False},
                     configure=_configure_conn,
+                    # Run a cheap ping on every connection acquired
+                    # from the pool. If it raises, the pool discards
+                    # the connection and tries another one. This is
+                    # what catches stale connections dropped by an
+                    # NLB / RDS Proxy / pgbouncer mid-session.
+                    check=AsyncConnectionPool.check_connection,
+                    # Recycle idle connections before LBs typically
+                    # close them, and force-recycle every connection
+                    # after max_lifetime regardless of activity.
+                    max_idle=entry.config.pool.max_idle_s,
+                    max_lifetime=entry.config.pool.max_lifetime_s,
                     name=f"pg-mcp:{entry.config.name}",
                     open=False,
                 )

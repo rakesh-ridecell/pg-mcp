@@ -97,11 +97,25 @@ _CONNECTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 class PoolSettings(BaseModel):
     min_size: int = Field(default=1, ge=0, le=32)
     max_size: int = Field(default=5, ge=1, le=32)
+    # How long an idle connection can sit in the pool before being
+    # recycled. Default 5 minutes — many cloud Postgres providers
+    # (RDS Proxy, NLB, pgbouncer) silently close TCP connections
+    # idle for >5-30 minutes. Recycling proactively avoids handing
+    # out a dead socket. Lower this if you observe stale-connection
+    # timeouts mid-session.
+    max_idle_s: float = Field(default=300.0, ge=10.0, le=3600.0)
+    # Hard upper bound — every connection is recycled this often
+    # regardless of activity. Defense in depth.
+    max_lifetime_s: float = Field(default=1800.0, ge=60.0, le=86400.0)
 
     @model_validator(mode="after")
     def _check_sizes(self) -> PoolSettings:
         if self.max_size < self.min_size:
             raise ValueError(f"pool.max_size ({self.max_size}) < min_size ({self.min_size})")
+        if self.max_idle_s > self.max_lifetime_s:
+            raise ValueError(
+                f"pool.max_idle_s ({self.max_idle_s}) > max_lifetime_s ({self.max_lifetime_s})"
+            )
         return self
 
 

@@ -149,16 +149,32 @@ def _register_tools(
         description=(
             "List all configured databases with their current status "
             "(available / unavailable / unsafe). Always the first tool "
-            "to call when starting a new session."
+            "to call when starting a new session. Pass `live=true` to "
+            "actively ping each pool (round-trip per connection); "
+            "useful when you suspect a pool has gone stale mid-session."
         ),
         annotations=ro_annotations,
     )
-    async def list_connections() -> str:
+    async def list_connections(live: bool = False) -> str:
         rid = _rid()
-        audit.tool_call(request_id=rid, tool="list_connections", connection=None, params={})
+        audit.tool_call(
+            request_id=rid,
+            tool="list_connections",
+            connection=None,
+            params={"live": live},
+        )
+
+        # Optional active probe: try a SELECT 1 on each pool. If it
+        # fails the pool returns the broken connection to its
+        # discard pile, so the next real tool call gets a fresh one.
+        live_results: dict[str, str | None] = {}
+        if live:
+            for entry in registry.entries():
+                live_results[entry.config.name] = await _live_ping(entry)
+
         lines = [
-            "| name | status | pool (open/max, waiting) | description | last_error |",
-            "|---|---|---|---|---|",
+            "| name | status | pool (open/max, waiting) | live | description | last_error |",
+            "|---|---|---|---|---|---|",
         ]
         for entry in registry.entries():
             pool_cell = "-"
@@ -171,11 +187,15 @@ def _register_tools(
                     pool_cell = f"{open_n}/{max_n}, {waiting}"
                 except Exception:
                     pool_cell = "?"
+            live_cell = "-"
+            if live:
+                live_cell = live_results.get(entry.config.name) or "ok"
             lines.append(
-                "| {name} | {status} | {pool} | {desc} | {err} |".format(
+                "| {name} | {status} | {pool} | {live} | {desc} | {err} |".format(
                     name=entry.config.name,
                     status=entry.status.value,
                     pool=pool_cell,
+                    live=(live_cell or "").replace("|", "\\|"),
                     desc=(entry.config.description or "").replace("|", "\\|"),
                     err=(entry.last_error or "").replace("|", "\\|"),
                 )
@@ -1387,6 +1407,27 @@ def _strip_leading_explain(sql: str) -> str:
     """
     match = _LEADING_EXPLAIN_RE.match(sql)
     return sql[match.end() :] if match else sql
+
+
+async def _live_ping(entry: Any) -> str | None:
+    """Run a cheap ``SELECT 1`` against the pool and return the outcome.
+
+    Returns ``None`` on success, or a short error string on failure.
+    Used by ``list_connections(live=True)``. We don't tear down the
+    pool on failure — the pool's own check/discard machinery handles
+    that for the next real tool call.
+    """
+    if entry.pool is None:
+        return "no pool"
+    try:
+        async with entry.pool.connection(timeout=5) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+                await cur.fetchone()
+            await conn.rollback()  # leave the connection IDLE
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"[:100]
 
 
 def _human_bytes(n: int | None) -> str:

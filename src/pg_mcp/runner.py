@@ -53,7 +53,65 @@ async def run_select(
     search_path: list[str] | None = None,
     acquire_timeout_s: float = 5.0,
 ) -> QueryResult:
-    """Execute *sql* inside a READ ONLY txn and return rendered results."""
+    """Execute *sql* inside a READ ONLY txn and return rendered results.
+
+    Retries once on stale-connection failures. The pool's ``check``
+    callback catches most dead sockets on acquire, but a connection
+    can also die between check-time and execute-time (LB drops it,
+    DB restarts, network blips). When that happens psycopg raises
+    one of the connection-loss exception classes, we discard the
+    bad connection (the pool's broken-conn machinery handles this
+    automatically), and try once more on a fresh connection.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(2):  # initial + one retry
+        try:
+            return await _execute_once(
+                pool,
+                sql,
+                row_limit=row_limit,
+                byte_limit=byte_limit,
+                cell_limit=cell_limit,
+                timeout_ms=timeout_ms,
+                search_path=search_path,
+                acquire_timeout_s=acquire_timeout_s,
+            )
+        except (
+            psycopg.OperationalError,
+            psycopg.InterfaceError,
+        ) as e:
+            # These two classes cover dropped connections, network
+            # errors, server restarts, and SSL renegotiation failures.
+            # Match further on SQLSTATE class 08 to avoid retrying on
+            # OperationalError variants that aren't connection-loss
+            # (e.g., 53300 too_many_connections).
+            sqlstate = getattr(e, "sqlstate", None) or ""
+            if sqlstate and not sqlstate.startswith("08"):
+                # Non-connection error — surface it normally.
+                raise PostgresError(str(e), sqlstate=sqlstate) from e
+            last_exc = e
+            if attempt == 0:
+                continue
+            raise PostgresError(
+                f"Connection failed twice (likely stale pool). Last error: {e}",
+                sqlstate=sqlstate or None,
+            ) from e
+    # Unreachable but keeps mypy happy.
+    raise PostgresError(str(last_exc or "unknown"))
+
+
+async def _execute_once(
+    pool: AsyncConnectionPool,
+    sql: str,
+    *,
+    row_limit: int,
+    byte_limit: int,
+    cell_limit: int,
+    timeout_ms: int,
+    search_path: list[str] | None,
+    acquire_timeout_s: float,
+) -> QueryResult:
+    """One attempt at executing the query. Used by run_select; may be retried."""
     notices: list[str] = []
     started = time.perf_counter()
 
@@ -104,6 +162,9 @@ async def run_select(
                     "`statement_timeout_ms` in the connection config."
                 )
                 raise QueryTimeoutError(hint) from e
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                # Bubble up so run_select can decide whether to retry.
+                raise
             except psycopg.Error as e:
                 sqlstate = getattr(e, "sqlstate", None)
                 raise PostgresError(str(e), sqlstate=sqlstate) from e
