@@ -47,7 +47,7 @@ SAMPLE_CONFIG = """\
 log_sql: hash
 
 defaults:
-  statement_timeout_ms: 30000   # per-query cancellation
+  statement_timeout_ms: 120000  # per-query cancellation
   row_limit: 1000               # max rows returned by run_query
   byte_limit: 1048576           # ~1 MiB response cap
   cell_limit: 8192              # truncate individual cells above this

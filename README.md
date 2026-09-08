@@ -79,7 +79,7 @@ Edit `~/.config/pg-mcp/config.yaml` to describe your databases:
 log_sql: hash   # hash | redacted | full  (see §Observability)
 
 defaults:
-  statement_timeout_ms: 30000
+  statement_timeout_ms: 120000
   row_limit: 1000
   byte_limit: 1048576
   cell_limit: 8192
