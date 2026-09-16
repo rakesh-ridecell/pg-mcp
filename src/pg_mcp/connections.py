@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -38,6 +39,12 @@ logger = logging.getLogger(__name__)
 # from this tool when running ``SELECT * FROM pg_stat_activity``.
 APPLICATION_NAME = f"pg-mcp/{os.getpid()}"
 
+# Minimum gap between automatic reopen attempts that `await_pool` triggers
+# for a connection stuck UNAVAILABLE. Without this, an LLM issuing several
+# tool calls in a row against a genuinely-down DB would pay a fresh TCP
+# connect + probe on every single call.
+AUTO_RETRY_COOLDOWN_S = 15.0
+
 
 class ConnectionStatus(StrEnum):
     """Lifecycle states for a configured connection."""
@@ -56,6 +63,7 @@ class ConnectionEntry:
     last_error: str | None = None
     last_probe_at: str | None = None
     version: int = 0  # bumped on each (re)open attempt; useful for diagnostics
+    last_open_attempt: float = 0.0  # time.monotonic() of most recent open attempt
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -286,6 +294,7 @@ class ConnectionRegistry:
     ) -> None:
         async with entry._lock:
             entry.version += 1
+            entry.last_open_attempt = time.monotonic()
             conninfo = build_conninfo(entry.config)
             logger.info(
                 "opening pool for %s (dsn=%s, pool=%d..%d)",
@@ -400,6 +409,14 @@ class ConnectionRegistry:
         This is the async variant tools should use — when the server
         has just started, pools may still be opening in the background,
         and we'd rather briefly wait than immediately fail.
+
+        If the connection is latched UNAVAILABLE (its one open attempt
+        failed, e.g. because a DB proxy wasn't up yet), a plain wait
+        would never recover — nothing else re-opens it. So once the
+        cooldown since the last attempt has elapsed, we transparently
+        retry the open here before giving up. This is what lets a
+        connection self-heal after the proxy comes back, without the
+        caller having to know to call `reconnect`.
         """
         entry = self.get_entry(name)
         if entry.status == ConnectionStatus.UNSAFE:
@@ -409,11 +426,21 @@ class ConnectionRegistry:
 
         # Wait for PENDING to transition. Poll at 50ms granularity.
         if entry.status == ConnectionStatus.PENDING:
-            import time as _time
-
-            deadline = _time.monotonic() + timeout
-            while entry.status == ConnectionStatus.PENDING and _time.monotonic() < deadline:
+            deadline = time.monotonic() + timeout
+            while entry.status == ConnectionStatus.PENDING and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
+            if entry.status == ConnectionStatus.AVAILABLE and entry.pool is not None:
+                return entry.pool
+            if entry.status == ConnectionStatus.UNSAFE:
+                raise ConnectionUnsafeError(
+                    f"connection {name!r} is marked UNSAFE: {entry.last_error}"
+                )
+
+        if (
+            entry.status == ConnectionStatus.UNAVAILABLE
+            and time.monotonic() - entry.last_open_attempt >= AUTO_RETRY_COOLDOWN_S
+        ):
+            entry = await self.reopen(name, timeout=timeout)
             if entry.status == ConnectionStatus.AVAILABLE and entry.pool is not None:
                 return entry.pool
             if entry.status == ConnectionStatus.UNSAFE:
